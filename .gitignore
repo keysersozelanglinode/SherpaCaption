@@ -1,10 +1,10 @@
 *.iml
+.idea/
 .gradle/
-/local.properties
-/.idea/
-/build/
-/app/build/
+.kotlin/
+local.properties
+build/
+**/build/
 captures/
 externalNativeBuild/
 .cxx/
-local.properties
