@@ -11,6 +11,8 @@ import android.util.Log
 import com.sherpacaption.app.audio.AudioCaptureConfig
 import com.sherpacaption.app.audio.AudioLevelMeter
 import com.sherpacaption.app.audio.AudioLevelStats
+import com.sherpacaption.app.audio.SilenceGate
+import com.sherpacaption.app.audio.SilenceTransition
 import com.sherpacaption.app.util.LogTags
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -19,6 +21,7 @@ class PlaybackAudioCapture(
     private val listener: Listener
 ) {
     private val isRunning = AtomicBoolean(false)
+    private val silenceGate = SilenceGate()
     private var audioRecord: AudioRecord? = null
     private var captureThread: Thread? = null
 
@@ -38,6 +41,7 @@ class PlaybackAudioCapture(
             .getOrNull() ?: return
 
         audioRecord = preparedCapture.audioRecord
+        silenceGate.reset()
         captureThread = Thread(
             { readAudioLoop(preparedCapture) },
             "PlaybackAudioCapture"
@@ -66,9 +70,10 @@ class PlaybackAudioCapture(
 
         try {
             record.startRecording()
+            listener.onAudioCaptureStarted()
             Log.i(
                 LogTags.SHERPA_CAPTION,
-                "PlaybackAudioCapture started: rate=${config.sampleRate}, " +
+                "AudioRecord started: rate=${config.sampleRate}, " +
                     "channels=${config.channelLabel}, buffer=${config.bufferSizeBytes}"
             )
 
@@ -83,18 +88,50 @@ class PlaybackAudioCapture(
                 }
 
                 val now = SystemClock.elapsedRealtime()
+                val stats = AudioLevelMeter.calculate(buffer, read, config)
+                val silenceResult = silenceGate.evaluate(stats, now)
+
+                when (silenceResult.transition) {
+                    SilenceTransition.SILENCE_DETECTED -> {
+                        Log.i(LogTags.SHERPA_CAPTION, "Silence detected")
+                        listener.onSilenceDetected()
+                    }
+                    SilenceTransition.SPEECH_RESUMED -> {
+                        Log.i(LogTags.SHERPA_CAPTION, "Speech resumed")
+                        listener.onSpeechResumed()
+                    }
+                    SilenceTransition.NONE -> Unit
+                }
+
+                if (silenceResult.shouldFeed) {
+                    listener.onPcmAudio(buffer, read, config)
+                } else {
+                    Log.d(
+                        LogTags.SHERPA_CAPTION,
+                        "Dropped silent PCM read=${stats.read} " +
+                            "avg=${stats.averageAbsolute} max=${stats.maxAbsolute}"
+                    )
+                }
+
                 if (now - lastUpdateTime >= config.updateIntervalMs) {
-                    val stats = AudioLevelMeter.calculate(buffer, read, config)
                     listener.onAudioLevel(stats)
                     lastUpdateTime = now
                 }
             }
         } catch (error: Throwable) {
-            val message = "Audio capture failed: ${error.message}"
+            val message =
+                "Audio capture thread failed: ${error.message ?: error.javaClass.simpleName}"
             Log.e(LogTags.SHERPA_CAPTION, message, error)
-            listener.onError(message)
+            runCatching { listener.onError(message) }
+                .onFailure {
+                    Log.e(LogTags.SHERPA_CAPTION, "Audio error callback failed", it)
+                }
         } finally {
             isRunning.set(false)
+            runCatching { listener.onAudioCaptureStopped() }
+                .onFailure {
+                    Log.e(LogTags.SHERPA_CAPTION, "Audio stopped callback failed", it)
+                }
             runCatching { record.stop() }
             record.release()
             if (audioRecord === record) {
@@ -162,7 +199,12 @@ class PlaybackAudioCapture(
     }
 
     interface Listener {
+        fun onPcmAudio(samples: ShortArray, sampleCount: Int, config: AudioCaptureConfig)
         fun onAudioLevel(stats: AudioLevelStats)
+        fun onAudioCaptureStarted()
+        fun onAudioCaptureStopped()
+        fun onSilenceDetected()
+        fun onSpeechResumed()
         fun onReadError(message: String)
         fun onError(message: String)
     }

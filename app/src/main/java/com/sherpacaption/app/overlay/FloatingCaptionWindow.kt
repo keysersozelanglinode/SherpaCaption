@@ -3,11 +3,19 @@ package com.sherpacaption.app.overlay
 import android.content.Context
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.provider.Settings
+import android.text.Layout
 import android.util.Log
 import android.view.Gravity
+import android.view.View
+import android.view.ViewGroup
 import android.view.WindowManager
+import android.widget.LinearLayout
 import android.widget.TextView
+import com.sherpacaption.app.subtitle.LearningSubtitleLayout
+import com.sherpacaption.app.subtitle.SubtitleDisplayMode
+import com.sherpacaption.app.util.DeveloperMetricsStore
 import com.sherpacaption.app.util.LogTags
 
 class FloatingCaptionWindow(
@@ -17,8 +25,12 @@ class FloatingCaptionWindow(
     private val appContext = context.applicationContext
     private val windowManager =
         appContext.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+    private val learningLayout = LearningSubtitleLayout(config.maxLines)
 
-    private var captionView: TextView? = null
+    private var rootView: LinearLayout? = null
+    private var captionViews: List<TextView> = emptyList()
+    private var windowLayoutParams: WindowManager.LayoutParams? = null
+    private var lastContentWidth = 0
 
     fun show(initialText: String) {
         if (!Settings.canDrawOverlays(appContext)) {
@@ -26,47 +38,100 @@ class FloatingCaptionWindow(
             return
         }
 
-        if (captionView != null) {
+        if (rootView != null) {
             updateText(initialText)
+            show()
             return
         }
 
-        val view = createCaptionView(initialText)
+        val (container, textViews) = createCaptionLayout()
         val layoutParams = config.createLayoutParams(appContext)
 
         runCatching {
-            windowManager.addView(view, layoutParams)
-            captionView = view
-            Log.i(LogTags.App, "Floating caption window shown")
+            windowManager.addView(container, layoutParams)
+            rootView = container
+            captionViews = textViews
+            windowLayoutParams = layoutParams
+            updateText(initialText)
+            isVisible = true
+            DeveloperMetricsStore.update { it.copy(overlayHidden = false) }
+            Log.i(
+                LogTags.App,
+                "Floating caption window shown: width=${layoutParams.width}"
+            )
         }.onFailure {
             Log.e(LogTags.App, "Failed to show floating caption window", it)
         }
     }
 
+    fun show() {
+        rootView?.post {
+            refreshWindowWidth()
+            rootView?.visibility = View.VISIBLE
+            isVisible = true
+            DeveloperMetricsStore.update { it.copy(overlayHidden = false) }
+        }
+    }
+
+    fun hide() {
+        rootView?.post {
+            rootView?.visibility = View.INVISIBLE
+            isVisible = false
+            DeveloperMetricsStore.update { it.copy(overlayHidden = true) }
+        }
+    }
+
     fun updateText(text: String) {
-        captionView?.post {
-            captionView?.text = text
+        rootView?.post {
+            refreshWindowWidth()
+            renderLines(listOf(text))
+        }
+    }
+
+    fun updateSubtitle(text: String, isFinal: Boolean) {
+        rootView?.post {
+            refreshWindowWidth()
+            val referenceView = captionViews.firstOrNull() ?: return@post
+            val contentWidth = config.textContentWidth(appContext)
+            if (lastContentWidth != 0 && lastContentWidth != contentWidth) {
+                learningLayout.reset()
+            }
+            lastContentWidth = contentWidth
+
+            val lines = when (config.displayMode) {
+                SubtitleDisplayMode.LEARNING ->
+                    learningLayout.update(text, isFinal, referenceView.paint, contentWidth)
+                else -> listOf(text)
+            }
+            renderLines(lines)
         }
     }
 
     fun release() {
-        val view = captionView ?: return
+        val view = rootView ?: return
         runCatching {
             windowManager.removeView(view)
             Log.i(LogTags.App, "Floating caption window removed")
         }.onFailure {
             Log.e(LogTags.App, "Failed to remove floating caption window", it)
         }
-        captionView = null
+        rootView = null
+        captionViews = emptyList()
+        windowLayoutParams = null
+        lastContentWidth = 0
+        learningLayout.reset()
+        isVisible = false
+        DeveloperMetricsStore.update { it.copy(overlayHidden = true) }
     }
 
-    private fun createCaptionView(text: String): TextView {
-        return TextView(appContext).apply {
-            this.text = text
-            setTextColor(Color.WHITE)
-            textSize = config.textSizeSp
-            gravity = Gravity.CENTER
-            includeFontPadding = true
+    private fun createCaptionLayout(): Pair<LinearLayout, List<TextView>> {
+        val container = LinearLayout(appContext).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
             setPadding(
                 config.horizontalPaddingDp.dpToPx(appContext),
                 config.verticalPaddingDp.dpToPx(appContext),
@@ -79,5 +144,67 @@ class FloatingCaptionWindow(
                 setColor(Color.argb(190, 0, 0, 0))
             }
         }
+
+        val textViews = List(config.maxLines) {
+            createLineView().also(container::addView)
+        }
+        return container to textViews
+    }
+
+    private fun createLineView(): TextView {
+        return TextView(appContext).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+            setTextColor(Color.WHITE)
+            textSize = config.textSizeSp
+            gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            textAlignment = View.TEXT_ALIGNMENT_VIEW_START
+            includeFontPadding = true
+            maxLines = 1
+            ellipsize = null
+            setHorizontallyScrolling(false)
+            setLineSpacing(0f, LINE_SPACING_MULTIPLIER)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                breakStrategy = Layout.BREAK_STRATEGY_SIMPLE
+                hyphenationFrequency = Layout.HYPHENATION_FREQUENCY_NONE
+            }
+            visibility = View.GONE
+        }
+    }
+
+    private fun renderLines(lines: List<String>) {
+        val visibleLines = lines.filter(String::isNotBlank).takeLast(config.maxLines)
+        captionViews.forEachIndexed { index, view ->
+            val line = visibleLines.getOrNull(index)
+            view.text = line.orEmpty()
+            view.visibility = if (line == null) View.GONE else View.VISIBLE
+        }
+    }
+
+    private fun refreshWindowWidth() {
+        val view = rootView ?: return
+        val params = windowLayoutParams ?: return
+        val targetWidth = config.overlayWidth(appContext)
+        if (params.width == targetWidth) {
+            return
+        }
+
+        params.width = targetWidth
+        runCatching {
+            windowManager.updateViewLayout(view, params)
+            Log.i(LogTags.App, "Floating caption width updated: width=$targetWidth")
+        }.onFailure {
+            Log.e(LogTags.App, "Failed to update floating caption width", it)
+        }
+    }
+
+    @Volatile
+    var isVisible: Boolean = false
+        private set
+
+    companion object {
+        private const val LINE_SPACING_MULTIPLIER = 1.15f
     }
 }

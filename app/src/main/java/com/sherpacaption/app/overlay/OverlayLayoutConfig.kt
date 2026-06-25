@@ -3,24 +3,25 @@ package com.sherpacaption.app.overlay
 import android.content.Context
 import android.graphics.PixelFormat
 import android.os.Build
+import android.util.DisplayMetrics
 import android.view.Gravity
 import android.view.WindowManager
+import com.sherpacaption.app.subtitle.SubtitleDisplayMode
 import kotlin.math.roundToInt
 
 data class OverlayLayoutConfig(
-    val widthRatio: Float = 0.9f,
+    val displayMode: SubtitleDisplayMode = SubtitleDisplayMode.LEARNING,
+    val widthRatio: Float = displayMode.widthRatio,
     val bottomMarginDp: Int = 96,
-    val horizontalPaddingDp: Int = 20,
-    val verticalPaddingDp: Int = 12,
-    val cornerRadiusDp: Int = 16,
-    val textSizeSp: Float = 22f
+    val horizontalPaddingDp: Int = displayMode.horizontalPaddingDp,
+    val verticalPaddingDp: Int = displayMode.verticalPaddingDp,
+    val cornerRadiusDp: Int = 6,
+    val textSizeSp: Float = displayMode.textSizeSp,
+    val maxLines: Int = displayMode.maxLines
 ) {
     fun createLayoutParams(context: Context): WindowManager.LayoutParams {
-        val displayMetrics = context.resources.displayMetrics
-        val overlayWidth = (displayMetrics.widthPixels * widthRatio).roundToInt()
-
         return WindowManager.LayoutParams(
-            overlayWidth,
+            overlayWidth(context),
             WindowManager.LayoutParams.WRAP_CONTENT,
             windowType(),
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
@@ -34,7 +35,32 @@ data class OverlayLayoutConfig(
         }
     }
 
+    fun overlayWidth(context: Context): Int {
+        return (currentScreenWidth(context) * widthRatio).roundToInt()
+    }
+
+    fun textContentWidth(context: Context): Int {
+        return (
+            overlayWidth(context) -
+                horizontalPaddingDp.dpToPx(context) * 2
+            ).coerceAtLeast(1)
+    }
+
     companion object {
+        private fun currentScreenWidth(context: Context): Int {
+            val windowManager =
+                context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                windowManager.currentWindowMetrics.bounds.width()
+            } else {
+                @Suppress("DEPRECATION")
+                val metrics = DisplayMetrics().also {
+                    windowManager.defaultDisplay.getRealMetrics(it)
+                }
+                metrics.widthPixels
+            }
+        }
+
         fun windowType(): Int {
             return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY

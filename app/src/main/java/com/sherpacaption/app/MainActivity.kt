@@ -17,6 +17,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -29,6 +30,9 @@ import com.sherpacaption.app.service.CaptionCaptureService
 import com.sherpacaption.app.service.CaptionServiceState
 import com.sherpacaption.app.ui.SherpaCaptionApp
 import com.sherpacaption.app.util.LogTags
+import com.sherpacaption.app.util.DeveloperMetrics
+import com.sherpacaption.app.util.DeveloperMetricsStore
+import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -44,6 +48,16 @@ class MainActivity : ComponentActivity() {
             }
             var serviceState by remember {
                 mutableStateOf(CaptionServiceState.NotStarted)
+            }
+            var developerMetrics by remember {
+                mutableStateOf(DeveloperMetricsStore.snapshot())
+            }
+
+            LaunchedEffect(Unit) {
+                while (true) {
+                    developerMetrics = DeveloperMetricsStore.snapshot()
+                    delay(DEVELOPER_REFRESH_INTERVAL_MS)
+                }
             }
 
             fun refreshPermissionState() {
@@ -90,6 +104,7 @@ class MainActivity : ComponentActivity() {
                 hasOverlayPermission = hasOverlayPermission,
                 notificationPermissionState = notificationPermissionState,
                 serviceState = serviceState,
+                developerMetrics = developerMetrics,
                 onRequestOverlayPermission = {
                     Log.i(LogTags.SHERPA_CAPTION, "Request overlay permission clicked")
                     if (PermissionStatusProvider.hasOverlayPermission(this)) {
@@ -133,5 +148,9 @@ class MainActivity : ComponentActivity() {
     private fun createOverlayPermissionIntent(): Intent {
         val packageUri = Uri.parse("package:$packageName")
         return Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, packageUri)
+    }
+
+    companion object {
+        private const val DEVELOPER_REFRESH_INTERVAL_MS = 1_000L
     }
 }

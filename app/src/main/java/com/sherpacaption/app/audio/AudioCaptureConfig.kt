@@ -14,4 +14,11 @@ data class AudioCaptureConfig(
             AudioFormat.CHANNEL_IN_MONO -> "mono"
             else -> "unknown"
         }
+
+    val channelCount: Int
+        get() = when (channelMask) {
+            AudioFormat.CHANNEL_IN_STEREO -> 2
+            AudioFormat.CHANNEL_IN_MONO -> 1
+            else -> 1
+        }
 }
