@@ -8,3 +8,8 @@ build/
 captures/
 externalNativeBuild/
 .cxx/
+app/src/main/assets/sherpa-onnx/
+app/libs/
+*.onnx
+*.aar
+*.apk
