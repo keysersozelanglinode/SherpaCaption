@@ -23,18 +23,17 @@ import com.sherpacaption.app.overlay.FloatingCaptionWindow
 import com.sherpacaption.app.sherpa.SherpaRecognitionStatus
 import com.sherpacaption.app.sherpa.SherpaRecognizer
 import com.sherpacaption.app.sherpa.SherpaRecognizerState
-import com.sherpacaption.app.subtitle.PunctuationRestorer
 import com.sherpacaption.app.subtitle.SubtitleFormatter
-import com.sherpacaption.app.util.LogTags
+import com.sherpacaption.app.util.ASRStateController
 import com.sherpacaption.app.util.AsrRuntimeState
 import com.sherpacaption.app.util.DeveloperMetricsStore
-import java.util.ArrayDeque
+import com.sherpacaption.app.util.LogTags
+import com.sherpacaption.app.util.PcmInputState
 import java.util.concurrent.atomic.AtomicBoolean
 
 class CaptionCaptureService : Service(), PlaybackAudioCapture.Listener {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val firstPcmLogged = AtomicBoolean(false)
-    private val punctuationRestorer = PunctuationRestorer()
     private var floatingCaptionWindow: FloatingCaptionWindow? = null
     private var mediaProjection: MediaProjection? = null
     private var playbackAudioCapture: PlaybackAudioCapture? = null
@@ -43,8 +42,6 @@ class CaptionCaptureService : Service(), PlaybackAudioCapture.Listener {
     private var serviceStartedTime = 0L
     private var lastSubtitleUpdateTime = 0L
     private var lastValidSpeechTime = 0L
-    private val pendingSubtitleLock = Any()
-    private val pendingSubtitleUpdates = ArrayDeque<PendingSubtitleUpdate>()
     @Volatile
     private var acceptedFrames = 0L
     @Volatile
@@ -62,18 +59,23 @@ class CaptionCaptureService : Service(), PlaybackAudioCapture.Listener {
     private var hasReceivedPcm = false
     @Volatile
     private var isServiceActive = false
-    @Volatile
-    private var isSilent = false
     private var lastPerformanceLogTime = 0L
+    private var lastWatchdogCheckTime = 0L
+    private var lastWatchdogFrames = 0L
+    private var lastPcmFeedTime = 0L
+    private var lastPipelineFrames = 0L
+    private var lastUiReplaceTime = 0L
 
     private val overlayHeartbeat = object : Runnable {
         override fun run() {
             if (!isServiceActive) {
                 return
             }
-            flushPendingSubtitles()
+            bindOverlayToState()
+            updateDebugOverlayIfNeeded()
             checkOverlayTimeout()
             updateDeveloperMetrics()
+            runInputWatchdog()
             logPerformanceIfDue()
             mainHandler.postDelayed(this, OVERLAY_HEARTBEAT_INTERVAL_MS)
         }
@@ -85,13 +87,12 @@ class CaptionCaptureService : Service(), PlaybackAudioCapture.Listener {
         return when (intent?.action) {
             ACTION_START -> {
                 Log.i(LogTags.SHERPA_CAPTION, "Service start")
+                Log.i(LogTags.SHERPA_CAPTION, "DEBUG_OVERLAY=$DEBUG_OVERLAY_ENABLED")
+                Log.i(
+                    LogTags.SHERPA_CAPTION,
+                    "REALTIME_RENDER_INTERVAL=$REALTIME_RENDER_INTERVAL_MS"
+                )
                 isServiceActive = true
-                DeveloperMetricsStore.update {
-                    it.copy(
-                        serviceRunning = true,
-                        asrState = AsrRuntimeState.INITIALIZING
-                    )
-                }
                 serviceStopReason = "running"
                 resetRuntimeStatus()
                 startCaptureForeground()
@@ -119,14 +120,7 @@ class CaptionCaptureService : Service(), PlaybackAudioCapture.Listener {
 
     override fun onDestroy() {
         isServiceActive = false
-        DeveloperMetricsStore.update {
-            it.copy(
-                serviceRunning = false,
-                audioCaptureRunning = false,
-                asrState = AsrRuntimeState.STOPPED,
-                overlayHidden = true
-            )
-        }
+        ASRStateController.stopService("service destroy")
         mainHandler.removeCallbacks(overlayHeartbeat)
         Log.i(LogTags.SHERPA_CAPTION, "Service stop reason: $serviceStopReason")
         releaseCaptureResources()
@@ -142,8 +136,13 @@ class CaptionCaptureService : Service(), PlaybackAudioCapture.Listener {
         config: AudioCaptureConfig
     ) {
         try {
+            if (!isPcmInputFlowing()) {
+                Log.d(LogTags.SHERPA_CAPTION, "PCM blocked by inputState=PAUSED")
+                return
+            }
             if (sampleCount > 0) {
                 hasReceivedPcm = true
+                lastPcmFeedTime = SystemClock.elapsedRealtime()
                 if (firstPcmLogged.compareAndSet(false, true)) {
                     Log.i(
                         LogTags.SHERPA_CAPTION,
@@ -165,43 +164,38 @@ class CaptionCaptureService : Service(), PlaybackAudioCapture.Listener {
     private fun onRecognitionStatus(status: SherpaRecognitionStatus) {
         asrState = status.state
         acceptedFrames = status.acceptedFrames
-        DeveloperMetricsStore.update {
-            it.copy(
-                asrState = when (status.state) {
-                    SherpaRecognizerState.INITIALIZING -> AsrRuntimeState.INITIALIZING
-                    SherpaRecognizerState.RUNNING ->
-                        if (isSilent) AsrRuntimeState.PAUSED else AsrRuntimeState.RUNNING
-                    SherpaRecognizerState.ERROR -> AsrRuntimeState.ERROR
-                },
-                asrFrames = status.acceptedFrames
-            )
-        }
+        ASRStateController.setAsrState(
+            when (status.state) {
+                SherpaRecognizerState.INITIALIZING -> AsrRuntimeState.INITIALIZING
+                SherpaRecognizerState.RUNNING -> AsrRuntimeState.RUNNING
+                SherpaRecognizerState.ERROR -> AsrRuntimeState.ERROR
+            }
+        )
+        ASRStateController.setFrames(status.acceptedFrames)
         status.noticeMessage?.let(::showTransientNotice)
         status.errorMessage?.let {
             showPersistentError(it)
             return
         }
-        if (isSilent) {
+        if (!isPcmInputFlowing()) {
             return
         }
 
+        if (status.acceptedFrames == lastPipelineFrames) {
+            Log.d(
+                LogTags.SHERPA_CAPTION,
+                "EVENT_FRAME_FROZEN frames=${status.acceptedFrames}"
+            )
+            return
+        }
+        lastPipelineFrames = status.acceptedFrames
+
         val rawSubtitle = status.partialText.trim()
-        if (rawSubtitle.isNotEmpty() &&
-            (rawSubtitle != latestRawSubtitle || status.isFinal)
-        ) {
+        if (rawSubtitle.isNotEmpty()) {
             latestRawSubtitle = rawSubtitle
-            latestPartialText = punctuationRestorer.restore(
-                text = SubtitleFormatter.format(rawSubtitle),
-                isFinal = status.isFinal
-            )
-            lastSubtitleUpdateTime = SystemClock.elapsedRealtime()
-            DeveloperMetricsStore.update {
-                it.copy(lastRecognitionTextTimeMs = System.currentTimeMillis())
-            }
-            enqueueSubtitleUpdate(
-                text = latestPartialText,
-                isFinal = status.isFinal
-            )
+            renderRealtimeSubtitle(rawSubtitle)
+        } else {
+            Log.d(LogTags.SHERPA_CAPTION, "EVENT_PIPELINE_NOOP")
         }
 
         when (status.state) {
@@ -216,12 +210,7 @@ class CaptionCaptureService : Service(), PlaybackAudioCapture.Listener {
 
     override fun onAudioLevel(stats: AudioLevelStats) {
         latestAudioLevel = stats
-        DeveloperMetricsStore.update {
-            it.copy(
-                pcmAverage = stats.averageAbsolute,
-                pcmMax = stats.maxAbsolute
-            )
-        }
+        ASRStateController.setPcmLevel(stats.averageAbsolute, stats.maxAbsolute)
         Log.d(LogTags.SHERPA_CAPTION, stats.toDebugText())
         if (stats.averageAbsolute >= SPEECH_AVERAGE_THRESHOLD ||
             stats.maxAbsolute >= SPEECH_MAX_THRESHOLD
@@ -230,46 +219,45 @@ class CaptionCaptureService : Service(), PlaybackAudioCapture.Listener {
         }
         if (latestAsrError == null &&
             latestPartialText.isEmpty() &&
-            !isSilent &&
-            floatingCaptionWindow?.isVisible == true
+            shouldShowDebugOverlay()
         ) {
-            showDiagnosticStatus(
-                "ASR running frames=$acceptedFrames " +
-                    "avg=${stats.averageAbsolute} max=${stats.maxAbsolute}"
-            )
+            showDiagnosticStatus(buildDebugOverlayText(stats))
         }
     }
 
     override fun onSilenceDetected() {
-        isSilent = true
-        sherpaRecognizer?.pauseInput()
-        latestPartialText = ""
+        if (!isPcmInputFlowing()) {
+            return
+        }
+        ASRStateController.setInputState(PcmInputState.PAUSED, "silence detected")
+        sherpaRecognizer?.clearPendingInput("silence")
         latestRawSubtitle = ""
-        synchronized(pendingSubtitleLock) {
-            pendingSubtitleUpdates.clear()
-        }
+        latestPartialText = ""
+        forceHideOverlay("input paused")
         Log.i(LogTags.SHERPA_CAPTION, "Silence detected")
-        DeveloperMetricsStore.update {
-            it.copy(silent = true, asrState = AsrRuntimeState.PAUSED)
-        }
+        Log.i(LogTags.SHERPA_CAPTION, "DEBUG_OVERLAY inputState=PAUSED hidden=true")
+        Log.i(LogTags.SHERPA_CAPTION, "ASR_INPUT_FLOW_ONLY silence=true")
     }
 
     override fun onSpeechResumed() {
-        isSilent = false
+        ASRStateController.setInputState(PcmInputState.FLOWING, "speech resumed")
         lastValidSpeechTime = SystemClock.elapsedRealtime()
-        sherpaRecognizer?.resumeInput()
         Log.i(LogTags.SHERPA_CAPTION, "Speech resumed")
-        DeveloperMetricsStore.update {
-            it.copy(silent = false, asrState = AsrRuntimeState.RUNNING)
-        }
+        Log.i(LogTags.SHERPA_CAPTION, "DEBUG_OVERLAY inputState=FLOWING")
+        Log.i(LogTags.SHERPA_CAPTION, "ASR_INPUT_FLOW_ONLY silence=false")
     }
 
     override fun onAudioCaptureStarted() {
-        DeveloperMetricsStore.update { it.copy(audioCaptureRunning = true) }
+        ASRStateController.setAudioCaptureRunning(true)
     }
 
     override fun onAudioCaptureStopped() {
-        DeveloperMetricsStore.update { it.copy(audioCaptureRunning = false) }
+        ASRStateController.setAudioCaptureRunning(false)
+        forceHideOverlay("audio stopped")
+    }
+
+    override fun isPcmInputFlowing(): Boolean {
+        return ASRStateController.snapshot().inputState == PcmInputState.FLOWING
     }
 
     override fun onReadError(message: String) {
@@ -356,13 +344,7 @@ class CaptionCaptureService : Service(), PlaybackAudioCapture.Listener {
         isServiceActive = false
         mainHandler.removeCallbacks(overlayHeartbeat)
         Log.i(LogTags.SHERPA_CAPTION, "Service stop reason: $reason")
-        DeveloperMetricsStore.update {
-            it.copy(
-                serviceRunning = false,
-                audioCaptureRunning = false,
-                asrState = AsrRuntimeState.STOPPED
-            )
-        }
+        ASRStateController.stopService(reason)
         releaseCaptureResources()
         releaseSherpaRecognizer()
         releaseFloatingCaptionWindow()
@@ -392,49 +374,42 @@ class CaptionCaptureService : Service(), PlaybackAudioCapture.Listener {
         mainHandler.post(overlayHeartbeat)
     }
 
-    private fun enqueueSubtitleUpdate(text: String, isFinal: Boolean) {
-        if (text.isBlank()) {
+    private fun renderRealtimeSubtitle(rawText: String) {
+        val now = SystemClock.elapsedRealtime()
+        if (!isRenderAllowed()) {
+            Log.d(LogTags.SHERPA_CAPTION, "REALTIME_RENDER_BLOCKED_STATE")
             return
         }
 
-        synchronized(pendingSubtitleLock) {
-            if (!isFinal && pendingSubtitleUpdates.lastOrNull()?.isFinal == false) {
-                pendingSubtitleUpdates.removeLast()
-            }
-            pendingSubtitleUpdates.addLast(
-                PendingSubtitleUpdate(
-                    text = text,
-                    isFinal = isFinal
-                )
-            )
-        }
-    }
-
-    private fun flushPendingSubtitles() {
-        if (isSilent) {
-            synchronized(pendingSubtitleLock) {
-                pendingSubtitleUpdates.clear()
-            }
+        val formattedText = SubtitleFormatter.format(rawText)
+        if (formattedText.isBlank()) {
+            Log.d(LogTags.SHERPA_CAPTION, "REALTIME_RENDER_SKIPPED_EMPTY")
             return
         }
 
-        val updates = synchronized(pendingSubtitleLock) {
-            buildList {
-                while (pendingSubtitleUpdates.isNotEmpty()) {
-                    add(pendingSubtitleUpdates.removeFirst())
-                }
-            }
+        if (formattedText == latestPartialText) {
+            Log.d(LogTags.SHERPA_CAPTION, "REALTIME_RENDER_SKIPPED_DUPLICATE")
+            return
         }
-        if (updates.isEmpty()) {
+
+        if (now - lastUiReplaceTime < REALTIME_RENDER_INTERVAL_MS) {
+            Log.d(LogTags.SHERPA_CAPTION, "EVENT_UI_DEBOUNCED")
             return
         }
 
         val window = floatingCaptionWindow ?: return
-        updates.forEach { update ->
-            window.updateSubtitle(update.text, update.isFinal)
+        if (floatingCaptionWindow?.isVisible != true) {
+            window.show(formattedText)
         }
+        window.replaceSubtitleLines(listOf(formattedText))
         window.show()
-        lastOverlayUpdateTime = SystemClock.elapsedRealtime()
+        latestPartialText = formattedText
+        lastSubtitleUpdateTime = now
+        lastOverlayUpdateTime = now
+        lastUiReplaceTime = now
+        ASRStateController.markRecognitionTextUpdated(System.currentTimeMillis())
+        ASRStateController.setOverlayHidden(false)
+        Log.d(LogTags.SHERPA_CAPTION, "REALTIME_RENDER_UPDATE")
     }
 
     private fun showDiagnosticStatus(message: String) {
@@ -443,12 +418,47 @@ class CaptionCaptureService : Service(), PlaybackAudioCapture.Listener {
             return
         }
 
-        floatingCaptionWindow?.updateText(SubtitleFormatter.format(message))
+        floatingCaptionWindow?.apply {
+            updateText(SubtitleFormatter.format(message))
+            show()
+        }
         lastOverlayUpdateTime = now
+    }
+
+    private fun updateDebugOverlayIfNeeded() {
+        if (!DEBUG_OVERLAY_ENABLED ||
+            latestAsrError != null ||
+            latestPartialText.isNotBlank() ||
+            !shouldShowDebugOverlay()
+        ) {
+            return
+        }
+
+        showDiagnosticStatus(buildDebugOverlayText(latestAudioLevel))
+    }
+
+    private fun buildDebugOverlayText(stats: AudioLevelStats?): String {
+        val avg = stats?.averageAbsolute ?: 0
+        val max = stats?.maxAbsolute ?: 0
+        return if (hasReceivedPcm || acceptedFrames > 0L) {
+            "ASR running frames=$acceptedFrames avg=$avg max=$max"
+        } else {
+            "waiting PCM / ASR running frames=$acceptedFrames avg=$avg max=$max"
+        }
     }
 
     private fun checkOverlayTimeout() {
         if (latestAsrError != null) {
+            return
+        }
+        if (DEBUG_OVERLAY_ENABLED && latestPartialText.isBlank() && shouldShowDebugOverlay()) {
+            return
+        }
+        if (!isRenderAllowed()) {
+            forceHideOverlay("state binding")
+            return
+        }
+        if (latestPartialText.isNotBlank()) {
             return
         }
 
@@ -458,6 +468,7 @@ class CaptionCaptureService : Service(), PlaybackAudioCapture.Listener {
             floatingCaptionWindow?.isVisible == true
         ) {
             floatingCaptionWindow?.hide()
+            ASRStateController.setOverlayHidden(true)
             Log.d(LogTags.SHERPA_CAPTION, "Overlay hidden after subtitle timeout")
         }
     }
@@ -470,7 +481,7 @@ class CaptionCaptureService : Service(), PlaybackAudioCapture.Listener {
             show()
         }
         lastOverlayUpdateTime = SystemClock.elapsedRealtime()
-        DeveloperMetricsStore.update { it.copy(asrState = AsrRuntimeState.ERROR) }
+        ASRStateController.setAsrState(AsrRuntimeState.ERROR)
     }
 
     private fun showTransientNotice(message: String) {
@@ -495,38 +506,108 @@ class CaptionCaptureService : Service(), PlaybackAudioCapture.Listener {
         serviceStartedTime = SystemClock.elapsedRealtime()
         lastSubtitleUpdateTime = 0L
         lastValidSpeechTime = serviceStartedTime
-        isSilent = false
         lastPerformanceLogTime = 0L
-        DeveloperMetricsStore.update {
-            it.copy(
-                serviceRunning = true,
-                audioCaptureRunning = false,
-                asrState = AsrRuntimeState.INITIALIZING,
-                silent = false,
-                asrFrames = 0L,
-                pcmAverage = 0,
-                pcmMax = 0,
-                lastRecognitionTextTimeMs = 0L,
-                recognitionMode = "initializing",
-                hotwordsEnabled = false
-            )
-        }
-        synchronized(pendingSubtitleLock) {
-            pendingSubtitleUpdates.clear()
-        }
+        lastWatchdogCheckTime = 0L
+        lastWatchdogFrames = 0L
+        lastPcmFeedTime = 0L
+        lastPipelineFrames = 0L
+        lastUiReplaceTime = 0L
+        ASRStateController.startServiceInitializing()
     }
 
     private fun updateDeveloperMetrics() {
-        DeveloperMetricsStore.update {
-            it.copy(
-                serviceRunning = isServiceActive,
-                asrFrames = acceptedFrames,
-                pcmAverage = latestAudioLevel?.averageAbsolute ?: 0,
-                pcmMax = latestAudioLevel?.maxAbsolute ?: 0,
-                silent = isSilent,
-                overlayHidden = floatingCaptionWindow?.isVisible != true
-            )
+        ASRStateController.setFrames(acceptedFrames)
+        ASRStateController.setOverlayHidden(floatingCaptionWindow?.isVisible != true)
+    }
+
+    private fun bindOverlayToState() {
+        if (mustHideOverlayForState() && floatingCaptionWindow?.isVisible == true) {
+            Log.w(LogTags.SHERPA_CAPTION, "STATE_BINDING_MISMATCH")
+            forceHideOverlay("state binding")
         }
+    }
+
+    private fun isRenderAllowed(): Boolean {
+        val state = ASRStateController.snapshot()
+        return state.asrState == AsrRuntimeState.RUNNING &&
+            state.inputState == PcmInputState.FLOWING &&
+            state.audioCaptureRunning
+    }
+
+    private fun shouldShowDebugOverlay(): Boolean {
+        if (!DEBUG_OVERLAY_ENABLED) {
+            return false
+        }
+
+        val state = ASRStateController.snapshot()
+        return state.serviceRunning && state.inputState == PcmInputState.FLOWING
+    }
+
+    private fun mustHideOverlayForState(): Boolean {
+        val state = ASRStateController.snapshot()
+        return state.inputState == PcmInputState.PAUSED ||
+            (!state.audioCaptureRunning && hasReceivedPcm)
+    }
+
+    private fun forceHideOverlay(reason: String) {
+        floatingCaptionWindow?.hide()
+        ASRStateController.setOverlayHidden(true)
+        Log.i(LogTags.SHERPA_CAPTION, "OVERLAY_FORCE_HIDDEN reason=$reason")
+    }
+
+    private fun runInputWatchdog() {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastWatchdogCheckTime < WATCHDOG_INTERVAL_MS) {
+            return
+        }
+        lastWatchdogCheckTime = now
+
+        val state = ASRStateController.snapshot()
+        val level = latestAudioLevel
+        val speechLikely = level != null &&
+            (level.averageAbsolute >= SPEECH_AVERAGE_THRESHOLD ||
+                level.maxAbsolute >= SPEECH_MAX_THRESHOLD)
+        val framesChanged = acceptedFrames != lastWatchdogFrames
+        lastWatchdogFrames = acceptedFrames
+
+        val desynced = state.serviceRunning != isServiceActive ||
+            state.audioCaptureRunning != (playbackAudioCapture != null) ||
+            state.asrFrames != acceptedFrames ||
+            (state.asrState == AsrRuntimeState.ERROR) != (latestAsrError != null)
+
+        if (desynced) {
+            Log.w(LogTags.SHERPA_CAPTION, "STATE_DESYNC_DETECTED state=$state")
+            Log.w(
+                LogTags.SHERPA_CAPTION,
+                "STATE_INCONSISTENT state=$state service=$isServiceActive " +
+                    "audio=${playbackAudioCapture != null} frames=$acceptedFrames " +
+                    "error=${latestAsrError != null}"
+            )
+            return
+        }
+
+        if (state.inputState == PcmInputState.FLOWING &&
+            speechLikely &&
+            !framesChanged &&
+            now - lastPcmFeedTime >= WATCHDOG_STALE_INPUT_MS
+        ) {
+            Log.w(
+                LogTags.SHERPA_CAPTION,
+                "STATE_DESYNC_DETECTED stale pcm feed state=$state"
+            )
+            Log.w(
+                LogTags.SHERPA_CAPTION,
+                "STATE_INCONSISTENT stale pcm feed avg=${level.averageAbsolute} " +
+                    "max=${level.maxAbsolute} frames=$acceptedFrames"
+            )
+            return
+        }
+
+        Log.d(
+            LogTags.SHERPA_CAPTION,
+            "STATE_CHECK_OK input=${state.inputState} speech=$speechLikely " +
+                "frames=$acceptedFrames changed=$framesChanged"
+        )
     }
 
     private fun logPerformanceIfDue() {
@@ -576,7 +657,9 @@ class CaptionCaptureService : Service(), PlaybackAudioCapture.Listener {
         val window = floatingCaptionWindow ?: FloatingCaptionWindow(this).also {
             floatingCaptionWindow = it
         }
-        window.show(SubtitleFormatter.format(WAITING_PCM_TEXT))
+        if (DEBUG_OVERLAY_ENABLED) {
+            window.show(SubtitleFormatter.format(WAITING_PCM_TEXT))
+        }
     }
 
     private fun releaseFloatingCaptionWindow() {
@@ -610,6 +693,10 @@ class CaptionCaptureService : Service(), PlaybackAudioCapture.Listener {
         private const val SPEECH_AVERAGE_THRESHOLD = 30
         private const val SPEECH_MAX_THRESHOLD = 300
         private const val PERFORMANCE_LOG_INTERVAL_MS = 30_000L
+        private const val WATCHDOG_INTERVAL_MS = 1_500L
+        private const val WATCHDOG_STALE_INPUT_MS = 2_000L
+        private const val REALTIME_RENDER_INTERVAL_MS = 150L
+        private const val DEBUG_OVERLAY_ENABLED = true
 
         fun createStartIntent(
             context: Context,
@@ -630,8 +717,4 @@ class CaptionCaptureService : Service(), PlaybackAudioCapture.Listener {
         }
     }
 
-    private data class PendingSubtitleUpdate(
-        val text: String,
-        val isFinal: Boolean
-    )
 }

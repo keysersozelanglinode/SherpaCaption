@@ -103,12 +103,12 @@ class PlaybackAudioCapture(
                     SilenceTransition.NONE -> Unit
                 }
 
-                if (silenceResult.shouldFeed) {
+                if (listener.isPcmInputFlowing()) {
                     listener.onPcmAudio(buffer, read, config)
                 } else {
                     Log.d(
                         LogTags.SHERPA_CAPTION,
-                        "Dropped silent PCM read=${stats.read} " +
+                        "Dropped paused PCM read=${stats.read} " +
                             "avg=${stats.averageAbsolute} max=${stats.maxAbsolute}"
                     )
                 }
@@ -205,6 +205,7 @@ class PlaybackAudioCapture(
         fun onAudioCaptureStopped()
         fun onSilenceDetected()
         fun onSpeechResumed()
+        fun isPcmInputFlowing(): Boolean
         fun onReadError(message: String)
         fun onError(message: String)
     }

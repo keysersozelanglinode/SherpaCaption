@@ -193,7 +193,6 @@ private fun AsrRuntimeState.toDisplayText(): String = when (this) {
     AsrRuntimeState.STOPPED -> "Stopped"
     AsrRuntimeState.INITIALIZING -> "Initializing"
     AsrRuntimeState.RUNNING -> "Running"
-    AsrRuntimeState.PAUSED -> "Paused"
     AsrRuntimeState.ERROR -> "Error"
 }
 

@@ -15,7 +15,7 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import com.sherpacaption.app.subtitle.LearningSubtitleLayout
 import com.sherpacaption.app.subtitle.SubtitleDisplayMode
-import com.sherpacaption.app.util.DeveloperMetricsStore
+import com.sherpacaption.app.util.ASRStateController
 import com.sherpacaption.app.util.LogTags
 
 class FloatingCaptionWindow(
@@ -54,7 +54,7 @@ class FloatingCaptionWindow(
             windowLayoutParams = layoutParams
             updateText(initialText)
             isVisible = true
-            DeveloperMetricsStore.update { it.copy(overlayHidden = false) }
+            ASRStateController.setOverlayHidden(false)
             Log.i(
                 LogTags.App,
                 "Floating caption window shown: width=${layoutParams.width}"
@@ -69,7 +69,7 @@ class FloatingCaptionWindow(
             refreshWindowWidth()
             rootView?.visibility = View.VISIBLE
             isVisible = true
-            DeveloperMetricsStore.update { it.copy(overlayHidden = false) }
+            ASRStateController.setOverlayHidden(false)
         }
     }
 
@@ -77,7 +77,7 @@ class FloatingCaptionWindow(
         rootView?.post {
             rootView?.visibility = View.INVISIBLE
             isVisible = false
-            DeveloperMetricsStore.update { it.copy(overlayHidden = true) }
+            ASRStateController.setOverlayHidden(true)
         }
     }
 
@@ -107,6 +107,14 @@ class FloatingCaptionWindow(
         }
     }
 
+    fun replaceSubtitleLines(lines: List<String>) {
+        rootView?.post {
+            refreshWindowWidth()
+            learningLayout.reset()
+            renderLines(wrapDisplayLines(lines))
+        }
+    }
+
     fun release() {
         val view = rootView ?: return
         runCatching {
@@ -121,7 +129,7 @@ class FloatingCaptionWindow(
         lastContentWidth = 0
         learningLayout.reset()
         isVisible = false
-        DeveloperMetricsStore.update { it.copy(overlayHidden = true) }
+        ASRStateController.setOverlayHidden(true)
     }
 
     private fun createCaptionLayout(): Pair<LinearLayout, List<TextView>> {
@@ -181,6 +189,44 @@ class FloatingCaptionWindow(
             view.text = line.orEmpty()
             view.visibility = if (line == null) View.GONE else View.VISIBLE
         }
+    }
+
+    private fun wrapDisplayLines(lines: List<String>): List<String> {
+        val paint = captionViews.firstOrNull()?.paint ?: return lines
+        val contentWidth = config.textContentWidth(appContext)
+        if (contentWidth <= 0) {
+            return lines
+        }
+
+        return lines.flatMap { line ->
+            wrapWords(line, paint, contentWidth)
+        }.takeLast(config.maxLines)
+    }
+
+    private fun wrapWords(
+        text: String,
+        paint: android.text.TextPaint,
+        contentWidth: Int
+    ): List<String> {
+        val words = text.split(Regex("""\s+""")).filter(String::isNotBlank)
+        if (words.isEmpty()) {
+            return emptyList()
+        }
+
+        val lines = mutableListOf<String>()
+        val currentWords = mutableListOf<String>()
+        words.forEach { word ->
+            val candidate = (currentWords + word).joinToString(" ")
+            if (currentWords.isNotEmpty() && paint.measureText(candidate) > contentWidth) {
+                lines += currentWords.joinToString(" ")
+                currentWords.clear()
+            }
+            currentWords += word
+        }
+        if (currentWords.isNotEmpty()) {
+            lines += currentWords.joinToString(" ")
+        }
+        return lines
     }
 
     private fun refreshWindowWidth() {

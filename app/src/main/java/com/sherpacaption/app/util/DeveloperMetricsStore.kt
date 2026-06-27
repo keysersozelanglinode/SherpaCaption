@@ -52,6 +52,5 @@ enum class AsrRuntimeState {
     STOPPED,
     INITIALIZING,
     RUNNING,
-    PAUSED,
     ERROR
 }
