@@ -103,15 +103,14 @@ class PlaybackAudioCapture(
                     SilenceTransition.NONE -> Unit
                 }
 
-                if (listener.isPcmInputFlowing()) {
-                    listener.onPcmAudio(buffer, read, config)
-                } else {
+                if (!listener.isPcmInputFlowing()) {
                     Log.d(
                         LogTags.SHERPA_CAPTION,
-                        "Dropped paused PCM read=${stats.read} " +
+                        "PCM direct feed continues while inputState=PAUSED read=${stats.read} " +
                             "avg=${stats.averageAbsolute} max=${stats.maxAbsolute}"
                     )
                 }
+                listener.onPcmAudio(buffer, read, config)
 
                 if (now - lastUpdateTime >= config.updateIntervalMs) {
                     listener.onAudioLevel(stats)

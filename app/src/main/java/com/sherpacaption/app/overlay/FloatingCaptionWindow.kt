@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
+import android.os.SystemClock
 import android.provider.Settings
 import android.text.Layout
 import android.util.Log
@@ -14,9 +15,10 @@ import android.view.WindowManager
 import android.widget.LinearLayout
 import android.widget.TextView
 import com.sherpacaption.app.subtitle.LearningSubtitleLayout
+import com.sherpacaption.app.subtitle.StaticLatestLinesRenderer
 import com.sherpacaption.app.subtitle.SubtitleDisplayMode
-import com.sherpacaption.app.util.ASRStateController
 import com.sherpacaption.app.util.LogTags
+import com.sherpacaption.app.util.PerformanceMetrics
 
 class FloatingCaptionWindow(
     context: Context,
@@ -54,7 +56,6 @@ class FloatingCaptionWindow(
             windowLayoutParams = layoutParams
             updateText(initialText)
             isVisible = true
-            ASRStateController.setOverlayHidden(false)
             Log.i(
                 LogTags.App,
                 "Floating caption window shown: width=${layoutParams.width}"
@@ -69,7 +70,6 @@ class FloatingCaptionWindow(
             refreshWindowWidth()
             rootView?.visibility = View.VISIBLE
             isVisible = true
-            ASRStateController.setOverlayHidden(false)
         }
     }
 
@@ -77,7 +77,6 @@ class FloatingCaptionWindow(
         rootView?.post {
             rootView?.visibility = View.INVISIBLE
             isVisible = false
-            ASRStateController.setOverlayHidden(true)
         }
     }
 
@@ -111,8 +110,44 @@ class FloatingCaptionWindow(
         rootView?.post {
             refreshWindowWidth()
             learningLayout.reset()
-            renderLines(wrapDisplayLines(lines))
+            renderLines(lines.takeLast(config.maxLines))
         }
+    }
+
+    fun updateRenderedLines(
+        lines: List<String>,
+        changedLines: Set<Int>
+    ) {
+        rootView?.post {
+            refreshWindowWidth()
+            renderIncrementalLines(lines, changedLines)
+        }
+    }
+
+    fun renderStaticLatestLines(
+        text: String,
+        renderer: StaticLatestLinesRenderer
+    ) {
+        rootView?.post {
+            val renderStartNs = SystemClock.elapsedRealtimeNanos()
+            refreshWindowWidth()
+            val referenceView = captionViews.firstOrNull() ?: return@post
+            val staticLayoutStartNs = SystemClock.elapsedRealtimeNanos()
+            val lines = renderer.render(
+                text = text,
+                paint = referenceView.paint,
+                widthPx = config.textContentWidth(appContext)
+            )
+            PerformanceMetrics.markStaticLayout(
+                SystemClock.elapsedRealtimeNanos() - staticLayoutStartNs
+            )
+            renderLines(lines)
+            PerformanceMetrics.markUiRender(SystemClock.elapsedRealtimeNanos() - renderStartNs)
+        }
+    }
+
+    fun resetFrozenSubtitle() {
+        renderLines(emptyList())
     }
 
     fun release() {
@@ -129,7 +164,6 @@ class FloatingCaptionWindow(
         lastContentWidth = 0
         learningLayout.reset()
         isVisible = false
-        ASRStateController.setOverlayHidden(true)
     }
 
     private fun createCaptionLayout(): Pair<LinearLayout, List<TextView>> {
@@ -186,8 +220,42 @@ class FloatingCaptionWindow(
         val visibleLines = lines.filter(String::isNotBlank).takeLast(config.maxLines)
         captionViews.forEachIndexed { index, view ->
             val line = visibleLines.getOrNull(index)
+            val setTextStartNs = SystemClock.elapsedRealtimeNanos()
             view.text = line.orEmpty()
             view.visibility = if (line == null) View.GONE else View.VISIBLE
+            PerformanceMetrics.markSetText(SystemClock.elapsedRealtimeNanos() - setTextStartNs)
+        }
+    }
+
+    private fun renderIncrementalLines(
+        lines: List<String>,
+        changedLines: Set<Int>
+    ) {
+        val visibleLines = lines.filter(String::isNotBlank).takeLast(config.maxLines)
+        captionViews.forEachIndexed { index, view ->
+            val lineNumber = index + 1
+            val line = visibleLines.getOrNull(index).orEmpty()
+            val shouldBeVisible = line.isNotBlank()
+            val targetVisibility = if (shouldBeVisible) View.VISIBLE else View.GONE
+            if (!changedLines.contains(lineNumber) &&
+                view.text.toString() == line &&
+                view.visibility == targetVisibility
+            ) {
+                Log.d(LogTags.SHERPA_CAPTION, "LAYOUT_SKIP_SAME_TEXT")
+                return@forEachIndexed
+            }
+
+            if (view.text.toString() != line) {
+                view.text = line
+                Log.d(LogTags.SHERPA_CAPTION, "UI_LINE_UPDATE line=$lineNumber")
+            } else {
+                Log.d(LogTags.SHERPA_CAPTION, "LAYOUT_SKIP_SAME_TEXT")
+            }
+
+            if (view.visibility != targetVisibility) {
+                view.visibility = targetVisibility
+                Log.d(LogTags.SHERPA_CAPTION, "UI_LINE_UPDATE line=$lineNumber")
+            }
         }
     }
 

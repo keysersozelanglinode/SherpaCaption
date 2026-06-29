@@ -1,6 +1,7 @@
 package com.sherpacaption.app.sherpa
 
 import android.content.Context
+import android.os.Process
 import android.os.SystemClock
 import android.util.Log
 import com.k2fsa.sherpa.onnx.FeatureConfig
@@ -11,11 +12,11 @@ import com.k2fsa.sherpa.onnx.OnlineStream
 import com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig
 import com.k2fsa.sherpa.onnx.VersionInfo
 import com.sherpacaption.app.audio.AudioCaptureConfig
-import com.sherpacaption.app.util.ASRStateController
-import com.sherpacaption.app.util.AsrRuntimeState
 import com.sherpacaption.app.util.LogTags
+import com.sherpacaption.app.util.PerformanceMetrics
 import java.io.File
-import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -26,21 +27,21 @@ class SherpaRecognizer(
     private val modelAssetDirectory: String = DEFAULT_MODEL_ASSET_DIRECTORY
 ) {
     private val appContext = context.applicationContext
-    private val isRunning = AtomicBoolean(true)
-    private val acceptsInput = AtomicBoolean(true)
+    private val lock = Object()
+    private val isRunning = AtomicBoolean(false)
+    private val threadPriorityApplied = AtomicBoolean(false)
     private val acceptedFrames = AtomicLong(0L)
-    private val inputQueue = LinkedBlockingQueue<PreparedAsrInput>(MAX_QUEUED_INPUTS)
-    private val workerThread = Thread(::recognitionLoop, "SherpaRecognizer").apply {
-        uncaughtExceptionHandler = Thread.UncaughtExceptionHandler { _, error ->
-            acceptsInput.set(false)
-            val message = initFailureMessage(error)
-            Log.e(LogTags.SHERPA_CAPTION, "ASR worker uncaught exception", error)
-            notifyStatus(
-                state = SherpaRecognizerState.ERROR,
-                errorMessage = message
-            )
+    private val lastAcceptedAtNs = AtomicLong(0L)
+    private val decodeTickExecutor: ScheduledExecutorService =
+        Executors.newSingleThreadScheduledExecutor { runnable ->
+            Thread(runnable, "SherpaDecodeTick").apply {
+                isDaemon = true
+                priority = Thread.NORM_PRIORITY + 1
+            }
         }
-    }
+    private var recognizer: OnlineRecognizer? = null
+    private var stream: OnlineStream? = null
+    private var lastEmittedText = ""
 
     init {
         runCatching {
@@ -52,7 +53,7 @@ class SherpaRecognizer(
         }.onFailure { error ->
             Log.e(LogTags.SHERPA_CAPTION, "sherpa-onnx native library load failed", error)
         }
-        workerThread.start()
+        initialize()
     }
 
     fun acceptPcm16(
@@ -60,183 +61,89 @@ class SherpaRecognizer(
         sampleCount: Int,
         config: AudioCaptureConfig
     ) {
-        if (!isRunning.get() || !acceptsInput.get()) {
-            return
+        val currentRecognizer: OnlineRecognizer
+        val currentStream: OnlineStream
+        synchronized(lock) {
+            if (!isRunning.get()) {
+                return
+            }
+            currentRecognizer = recognizer ?: return
+            currentStream = stream ?: return
         }
 
-        val preparedInput = runCatching {
+        val input = runCatching {
             AsrInputPreparer.prepare(samples, sampleCount, config)
         }.onFailure { error ->
-            acceptsInput.set(false)
-            val message = "ASR input preparation failed: ${error.description()}"
-            Log.e(LogTags.SHERPA_CAPTION, message, error)
-            notifyStatus(
-                state = SherpaRecognizerState.ERROR,
-                errorMessage = message
-            )
+            listener.onError("ASR input failed: ${error.description()}")
         }.getOrNull() ?: return
 
-        if (preparedInput.samples.isEmpty()) {
+        if (input.samples.isEmpty()) {
             return
         }
 
-        if (!inputQueue.offer(preparedInput)) {
-            Log.w(LogTags.SHERPA_CAPTION, "ASR input queue full; dropped newest PCM chunk")
+        applyDecodeThreadPriorityIfNeeded()
+        synchronized(lock) {
+            if (!isRunning.get()) {
+                return
+            }
+            runCatching {
+                input.samples.feedInLowLatencyChunks { chunk ->
+                    val acceptStartNs = SystemClock.elapsedRealtimeNanos()
+                    currentStream.acceptWaveform(chunk, input.sampleRate)
+                    val acceptedAtNs = SystemClock.elapsedRealtimeNanos()
+                    lastAcceptedAtNs.set(acceptedAtNs)
+                    PerformanceMetrics.markAcceptWaveform(acceptedAtNs - acceptStartNs)
+                    val frames = acceptedFrames.addAndGet(chunk.size.toLong())
+                    decodeReadyChunks(
+                        recognizer = currentRecognizer,
+                        stream = currentStream,
+                        frames = frames,
+                        acceptedAtNs = acceptedAtNs
+                    )
+                }
+            }.onFailure { error ->
+                val message = "ASR failed: ${error.description()}"
+                Log.e(LogTags.SHERPA_CAPTION, message, error)
+                listener.onError(message)
+            }
         }
-    }
-
-    fun clearPendingInput(reason: String) {
-        val cleared = inputQueue.size
-        inputQueue.clear()
-        Log.i(
-            LogTags.SHERPA_CAPTION,
-            "ASR_QUEUE_CLEARED size=$cleared reason=$reason"
-        )
     }
 
     fun release() {
-        if (!isRunning.getAndSet(false)) {
-            return
-        }
-
-        acceptsInput.set(false)
-        inputQueue.clear()
-        workerThread.interrupt()
-        if (Thread.currentThread() !== workerThread) {
-            runCatching { workerThread.join(RELEASE_JOIN_TIMEOUT_MS) }
-                .onFailure {
-                    Log.w(LogTags.SHERPA_CAPTION, "Waiting for SherpaRecognizer failed", it)
-                }
-        }
-        Log.i(LogTags.SHERPA_CAPTION, "SherpaRecognizer released")
-        ASRStateController.setAsrState(AsrRuntimeState.STOPPED)
-    }
-
-    private fun recognitionLoop() {
-        var recognizer: OnlineRecognizer? = null
-        var stream: OnlineStream? = null
-        var initialized = false
-        var lastLatencyHintLogTime = 0L
-
-        try {
-            Log.i(LogTags.SHERPA_CAPTION, "ASR init start")
-            notifyStatus(state = SherpaRecognizerState.INITIALIZING)
-            val modelFiles = prepareModelFiles()
-            val decoderMode = selectedDecoderMode()
-            Log.i(LogTags.SHERPA_CAPTION, "DECODER_MODE=${decoderMode.name}")
-            val hotwordPreparation = HotwordManager(
-                outputDirectory = File(appContext.filesDir, HOTWORDS_DIRECTORY)
-            ).prepare(
-                bpeModelFile = modelFiles.bpeModel?.let(::File),
-                bpeVocabFile = modelFiles.bpeVocab?.let(::File)
-            )
-            val recognizerSetup = createRecognizerWithFallback(
-                modelFiles = modelFiles,
-                hotwordPreparation = hotwordPreparation,
-                decoderMode = decoderMode
-            )
-            recognizer = recognizerSetup.recognizer
-            ASRStateController.setRecognitionConfig(
-                recognitionMode = recognizerSetup.modeName,
-                hotwordsEnabled = recognizerSetup.hotwordsEnabled
-            )
-            recognizerSetup.warning?.let { warning ->
-                Log.w(LogTags.SHERPA_CAPTION, warning)
-                notifyStatus(
-                    state = SherpaRecognizerState.INITIALIZING,
-                    noticeMessage = warning
-                )
+        synchronized(lock) {
+            if (!isRunning.getAndSet(false)) {
+                return
             }
-            Log.i(
-                LogTags.SHERPA_CAPTION,
-                "ASR config: modelType=$MODEL_TYPE, " +
-                    "decoding=${recognizerSetup.decodingMethod}, " +
-                    "mode=${recognizerSetup.modeName}, " +
-                    "maxActivePaths=${recognizerSetup.maxActivePaths}, " +
-                    "threads=$NUM_THREADS, sampleRate=$SAMPLE_RATE, " +
-                    "featureDim=$FEATURE_DIM, hotwords=${recognizerSetup.hotwordsEnabled}, " +
-                    "hotwordsScore=${recognizerSetup.hotwordsScore}"
-            )
-            stream = recognizer.createStream()
-            initialized = true
-            Log.i(LogTags.SHERPA_CAPTION, "ASR init success")
-            Log.i(LogTags.SHERPA_CAPTION, "ASR_LIFECYCLE_FIXED")
-            Log.i(LogTags.SHERPA_CAPTION, "ASR_INPUT_FLOW_ONLY")
-            Log.i(LogTags.SHERPA_CAPTION, "ASR_NO_RESET_POLICY")
-            Log.i(LogTags.SHERPA_CAPTION, "ASR decode loop start")
-            notifyStatus(state = SherpaRecognizerState.RUNNING)
-
-            while (isRunning.get()) {
-                val input = inputQueue.poll(INPUT_POLL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-                    ?: continue
-
-                try {
-                    stream.acceptWaveform(input.samples, input.sampleRate)
-                    val frames = acceptedFrames.addAndGet(input.samples.size.toLong())
-                    ASRStateController.setAsrState(AsrRuntimeState.RUNNING)
-                    ASRStateController.setFrames(frames)
-                    val now = SystemClock.elapsedRealtime()
-                    if (now - lastLatencyHintLogTime >= LATENCY_HINT_LOG_INTERVAL_MS) {
-                        Log.d(
-                            LogTags.SHERPA_CAPTION,
-                            "ASR_LATENCY_HINT frames=$frames queue=${inputQueue.size}"
-                        )
-                        lastLatencyHintLogTime = now
-                    }
-                    while (recognizer.isReady(stream)) {
-                        recognizer.decode(stream)
-                    }
-
-                    val text = recognizer.getResult(stream).text.trim()
-                    val isFinal = recognizer.isEndpoint(stream)
-                    notifyStatus(
-                        state = SherpaRecognizerState.RUNNING,
-                        partialText = text,
-                        isFinal = isFinal
-                    )
-
-                } catch (error: Throwable) {
-                    acceptsInput.set(false)
-                    val message = "ASR decode failed: ${error.description()}"
-                    Log.e(LogTags.SHERPA_CAPTION, "ASR decode loop fail", error)
-                    notifyStatus(
-                        state = SherpaRecognizerState.ERROR,
-                        errorMessage = message
-                    )
-                    break
-                }
-            }
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
-        } catch (error: MissingModelException) {
-            acceptsInput.set(false)
-            val message = error.message.orEmpty()
-            Log.e(LogTags.SHERPA_CAPTION, "ASR init fail: $message")
-            notifyStatus(
-                state = SherpaRecognizerState.ERROR,
-                errorMessage = message
-            )
-        } catch (error: Throwable) {
-            acceptsInput.set(false)
-            val message = if (initialized) {
-                "ASR decode failed: ${error.description()}"
-            } else {
-                initFailureMessage(error)
-            }
-            Log.e(
-                LogTags.SHERPA_CAPTION,
-                if (initialized) "ASR decode loop fail" else "ASR init fail",
-                error
-            )
-            notifyStatus(
-                state = SherpaRecognizerState.ERROR,
-                errorMessage = message
-            )
-        } finally {
             runCatching { stream?.release() }
                 .onFailure { Log.w(LogTags.SHERPA_CAPTION, "OnlineStream release failed", it) }
             runCatching { recognizer?.release() }
                 .onFailure { Log.w(LogTags.SHERPA_CAPTION, "OnlineRecognizer release failed", it) }
+            stream = null
+            recognizer = null
+            lastEmittedText = ""
+            decodeTickExecutor.shutdownNow()
+            Log.i(LogTags.SHERPA_CAPTION, "ASR state=IDLE")
+        }
+    }
+
+    private fun initialize() {
+        synchronized(lock) {
+            runCatching {
+                val modelFiles = prepareModelFiles()
+                val createdRecognizer = createRecognizer(modelFiles)
+                recognizer = createdRecognizer
+                stream = createdRecognizer.createStream()
+                acceptedFrames.set(0L)
+                lastAcceptedAtNs.set(0L)
+                lastEmittedText = ""
+                isRunning.set(true)
+                startDecodeTick()
+                Log.i(LogTags.SHERPA_CAPTION, "ASR state=RUNNING")
+            }.onFailure { error ->
+                val message = "ASR init failed: ${error.description()}"
+                Log.e(LogTags.SHERPA_CAPTION, message, error)
+                listener.onError(message)
+            }
         }
     }
 
@@ -249,9 +156,7 @@ class SherpaRecognizer(
         val missingNames = requiredNames.filterNot(assetNames::contains)
 
         if (missingNames.isNotEmpty()) {
-            throw MissingModelException(
-                "ASR init failed: missing model file(s): ${missingNames.joinToString()}"
-            )
+            error("missing model file(s): ${missingNames.joinToString()}")
         }
 
         val outputDirectory = File(appContext.filesDir, modelAssetDirectory)
@@ -276,13 +181,7 @@ class SherpaRecognizer(
             encoder = File(outputDirectory, encoderName).absolutePath,
             decoder = File(outputDirectory, decoderName).absolutePath,
             joiner = File(outputDirectory, joinerName).absolutePath,
-            tokens = File(outputDirectory, TOKENS_FILE).absolutePath,
-            bpeModel = File(outputDirectory, BPE_MODEL_FILE)
-                .takeIf(File::isFile)
-                ?.absolutePath,
-            bpeVocab = File(outputDirectory, BPE_VOCAB_FILE)
-                .takeIf(File::isFile)
-                ?.absolutePath
+            tokens = File(outputDirectory, TOKENS_FILE).absolutePath
         )
     }
 
@@ -298,100 +197,14 @@ class SherpaRecognizer(
             if (outputFile.isFile && outputFile.length() == input.available().toLong()) {
                 return
             }
-
             outputFile.outputStream().buffered().use { output ->
                 input.copyTo(output)
             }
         }
     }
 
-    private fun createRecognizerWithFallback(
-        modelFiles: ModelFiles,
-        hotwordPreparation: HotwordManager.HotwordPreparation,
-        decoderMode: DecoderMode
-    ): RecognizerSetup {
-        if (!decoderMode.hotwordsEnabled) {
-            return RecognizerSetup(
-                recognizer = createRecognizer(
-                    modelFiles = modelFiles,
-                    decodingMethod = decoderMode.decodingMethod,
-                    hotwordPreparation = null,
-                    maxActivePaths = decoderMode.maxActivePaths,
-                    hotwordsScore = decoderMode.hotwordsScore
-                ).also(::requireValidNativePointer),
-                decodingMethod = decoderMode.decodingMethod,
-                hotwordsEnabled = false,
-                modeName = decoderMode.name,
-                maxActivePaths = decoderMode.maxActivePaths,
-                hotwordsScore = decoderMode.hotwordsScore
-            )
-        }
-
-        if (hotwordPreparation is HotwordManager.HotwordPreparation.Enabled) {
-            val hotwordAttempt = runCatching {
-                createRecognizer(
-                    modelFiles = modelFiles,
-                    decodingMethod = decoderMode.decodingMethod,
-                    hotwordPreparation = hotwordPreparation,
-                    maxActivePaths = decoderMode.maxActivePaths,
-                    hotwordsScore = decoderMode.hotwordsScore
-                ).also(::requireValidNativePointer)
-            }
-            hotwordAttempt.getOrNull()?.let { recognizer ->
-                return RecognizerSetup(
-                    recognizer = recognizer,
-                    decodingMethod = decoderMode.decodingMethod,
-                    hotwordsEnabled = true,
-                    modeName = decoderMode.name,
-                    maxActivePaths = decoderMode.maxActivePaths,
-                    hotwordsScore = decoderMode.hotwordsScore
-                )
-            }
-
-            val reason = hotwordAttempt.exceptionOrNull()?.description()
-                ?: "native recognizer initialization returned an invalid handle"
-            return RecognizerSetup(
-                recognizer = createRecognizer(
-                    modelFiles = modelFiles,
-                    decodingMethod = decoderMode.decodingMethod,
-                    hotwordPreparation = null,
-                    maxActivePaths = decoderMode.maxActivePaths,
-                    hotwordsScore = decoderMode.hotwordsScore
-                ).also(::requireValidNativePointer),
-                decodingMethod = decoderMode.decodingMethod,
-                hotwordsEnabled = false,
-                modeName = decoderMode.name,
-                maxActivePaths = decoderMode.maxActivePaths,
-                hotwordsScore = decoderMode.hotwordsScore,
-                warning = "Hotwords disabled: $reason"
-            )
-        }
-
-        val reason = (hotwordPreparation as HotwordManager.HotwordPreparation.Disabled).reason
-        return RecognizerSetup(
-            recognizer = createRecognizer(
-                modelFiles = modelFiles,
-                decodingMethod = decoderMode.decodingMethod,
-                hotwordPreparation = null,
-                maxActivePaths = decoderMode.maxActivePaths,
-                hotwordsScore = decoderMode.hotwordsScore
-            ).also(::requireValidNativePointer),
-            decodingMethod = decoderMode.decodingMethod,
-            hotwordsEnabled = false,
-            modeName = decoderMode.name,
-            maxActivePaths = decoderMode.maxActivePaths,
-            hotwordsScore = decoderMode.hotwordsScore,
-            warning = "Hotwords disabled: $reason"
-        )
-    }
-
-    private fun createRecognizer(
-        modelFiles: ModelFiles,
-        decodingMethod: String,
-        hotwordPreparation: HotwordManager.HotwordPreparation.Enabled?,
-        maxActivePaths: Int,
-        hotwordsScore: Float
-    ): OnlineRecognizer {
+    private fun createRecognizer(modelFiles: ModelFiles): OnlineRecognizer {
+        val profileConfig = SELECTED_PROFILE.toConfig()
         val transducerConfig = OnlineTransducerModelConfig().apply {
             encoder = modelFiles.encoder
             decoder = modelFiles.decoder
@@ -400,11 +213,9 @@ class SherpaRecognizer(
         val modelConfig = OnlineModelConfig().apply {
             transducer = transducerConfig
             tokens = modelFiles.tokens
-            numThreads = NUM_THREADS
+            numThreads = profileConfig.numThreads
             provider = PROVIDER
             modelType = MODEL_TYPE
-            modelingUnit = if (hotwordPreparation != null) MODELING_UNIT_BPE else ""
-            bpeVocab = hotwordPreparation?.bpeVocabFile?.absolutePath.orEmpty()
         }
         val recognizerConfig = OnlineRecognizerConfig().apply {
             featConfig = FeatureConfig().apply {
@@ -412,127 +223,189 @@ class SherpaRecognizer(
                 featureDim = FEATURE_DIM
             }
             this.modelConfig = modelConfig
-            this.decodingMethod = decodingMethod
-            this.maxActivePaths = maxActivePaths
-            this.hotwordsScore = hotwordsScore
-            hotwordsFile = hotwordPreparation?.hotwordsFile?.absolutePath.orEmpty()
+            decodingMethod = profileConfig.decodingMethod
+            maxActivePaths = profileConfig.maxActivePaths
+            hotwordsScore = profileConfig.hotwordsScore
+            hotwordsFile = ""
             enableEndpoint = true
         }
 
+        Log.i(
+            LogTags.SHERPA_CAPTION,
+            "ASR decoder profile=${profileConfig.profile} " +
+                "decodingMethod=${profileConfig.decodingMethod} " +
+                "maxActivePaths=${profileConfig.maxActivePaths} " +
+                "numThreads=${profileConfig.numThreads} hotwords=disabled"
+        )
         return OnlineRecognizer(null, recognizerConfig)
     }
 
-    private fun requireValidNativePointer(recognizer: OnlineRecognizer) {
-        val pointer = runCatching {
-            OnlineRecognizer::class.java
-                .getDeclaredField("ptr")
-                .apply { isAccessible = true }
-                .getLong(recognizer)
-        }.getOrElse { error ->
-            recognizer.release()
-            error("cannot validate native recognizer handle: ${error.description()}")
-        }
-        if (pointer == 0L) {
-            recognizer.release()
-            error("native recognizer initialization returned a null handle")
-        }
-    }
-
-    private fun selectedDecoderMode(): DecoderMode {
-        return when (DECODER_MODE) {
-            DECODER_MODE_LOW_LATENCY -> DecoderMode(
-                name = DECODER_MODE_LOW_LATENCY,
-                decodingMethod = DECODING_METHOD_GREEDY,
-                maxActivePaths = LOW_LATENCY_MAX_ACTIVE_PATHS,
-                hotwordsEnabled = false,
-                hotwordsScore = HOTWORDS_SCORE
-            )
-
-            DECODER_MODE_ACCURACY -> DecoderMode(
-                name = DECODER_MODE_ACCURACY,
-                decodingMethod = DECODING_METHOD_MODIFIED_BEAM_SEARCH,
-                maxActivePaths = ACCURACY_MAX_ACTIVE_PATHS,
-                hotwordsEnabled = true,
-                hotwordsScore = HOTWORDS_SCORE
-            )
-
-            else -> DecoderMode(
-                name = DECODER_MODE_BALANCED,
-                decodingMethod = DECODING_METHOD_MODIFIED_BEAM_SEARCH,
-                maxActivePaths = BALANCED_MAX_ACTIVE_PATHS,
-                hotwordsEnabled = true,
-                hotwordsScore = HOTWORDS_SCORE
-            )
-        }
-    }
-
-    private fun notifyStatus(
-        state: SherpaRecognizerState,
-        partialText: String = "",
-        errorMessage: String? = null,
-        noticeMessage: String? = null,
-        isFinal: Boolean = false
+    private fun decodeReadyChunks(
+        recognizer: OnlineRecognizer,
+        stream: OnlineStream,
+        frames: Long,
+        acceptedAtNs: Long
     ) {
-        if (!isRunning.get()) {
+        var decodedAny = false
+        while (recognizer.isReady(stream)) {
+            val decodeStartNs = SystemClock.elapsedRealtimeNanos()
+            PerformanceMetrics.markDecodeQueue(decodeStartNs - acceptedAtNs)
+            recognizer.decode(stream)
+            decodedAny = true
+            PerformanceMetrics.markDecode(SystemClock.elapsedRealtimeNanos() - decodeStartNs)
+            emitResultIfChanged(recognizer, stream, frames, acceptedAtNs)
+        }
+
+        if (!decodedAny) {
+            emitResultIfChanged(recognizer, stream, frames, acceptedAtNs)
+        }
+    }
+
+    private fun runTimeDrivenDecodeTick() {
+        val currentRecognizer: OnlineRecognizer
+        val currentStream: OnlineStream
+        synchronized(lock) {
+            if (!isRunning.get()) {
+                return
+            }
+            currentRecognizer = recognizer ?: return
+            currentStream = stream ?: return
+            val acceptedAtNs = lastAcceptedAtNs.get()
+            if (acceptedAtNs == 0L) {
+                return
+            }
+            val tickStartNs = SystemClock.elapsedRealtimeNanos()
+            PerformanceMetrics.markDecodeGatingDelay(tickStartNs - acceptedAtNs)
+            decodeReadyChunks(
+                recognizer = currentRecognizer,
+                stream = currentStream,
+                frames = acceptedFrames.get(),
+                acceptedAtNs = acceptedAtNs
+            )
+        }
+    }
+
+    private fun emitResultIfChanged(
+        recognizer: OnlineRecognizer,
+        stream: OnlineStream,
+        frames: Long,
+        acceptedAtNs: Long
+    ) {
+        val getResultStartNs = SystemClock.elapsedRealtimeNanos()
+        val text = recognizer.getResult(stream).text.trim()
+        val resultAtNs = SystemClock.elapsedRealtimeNanos()
+        PerformanceMetrics.markGetResult(resultAtNs - getResultStartNs, text)
+        if (text.isBlank() || text == lastEmittedText) {
+            return
+        }
+
+        lastEmittedText = text
+        PerformanceMetrics.markResultAvailability(resultAtNs - acceptedAtNs)
+        Log.d(LogTags.SHERPA_CAPTION, "PCM_RECEIVED frames=$frames")
+        Log.d(LogTags.SHERPA_CAPTION, "ASR_RESULT text=$text")
+        listener.onResult(text, frames)
+    }
+
+    private fun FloatArray.feedInLowLatencyChunks(block: (FloatArray) -> Unit) {
+        if (size <= LOW_LATENCY_FEED_CHUNK_SAMPLES) {
+            block(this)
+            return
+        }
+
+        var offset = 0
+        while (offset < size) {
+            val nextOffset = (offset + LOW_LATENCY_FEED_CHUNK_SAMPLES).coerceAtMost(size)
+            block(copyOfRange(offset, nextOffset))
+            offset = nextOffset
+        }
+    }
+
+    private fun applyDecodeThreadPriorityIfNeeded() {
+        if (!threadPriorityApplied.compareAndSet(false, true)) {
             return
         }
 
         runCatching {
-            listener.onRecognitionStatus(
-                SherpaRecognitionStatus(
-                    state = state,
-                    partialText = partialText,
-                    errorMessage = errorMessage,
-                    noticeMessage = noticeMessage,
-                    acceptedFrames = acceptedFrames.get(),
-                    isFinal = isFinal
-                )
-            )
+            Process.setThreadPriority(Process.THREAD_PRIORITY_MORE_FAVORABLE)
+            Log.i(LogTags.SHERPA_CAPTION, "ASR decode thread priority=more_favorable")
         }.onFailure { error ->
-            Log.e(LogTags.SHERPA_CAPTION, "ASR status callback failed", error)
+            Log.w(LogTags.SHERPA_CAPTION, "ASR thread priority update failed", error)
         }
     }
 
-    private fun initFailureMessage(error: Throwable): String {
-        return "ASR init failed: ${error.description()}"
+    private fun startDecodeTick() {
+        decodeTickExecutor.scheduleAtFixedRate(
+            {
+                applyDecodeThreadPriorityIfNeeded()
+                runCatching { runTimeDrivenDecodeTick() }
+                    .onFailure { error ->
+                        Log.w(LogTags.SHERPA_CAPTION, "ASR decode tick failed", error)
+                    }
+            },
+            DECODE_TICK_INTERVAL_MS,
+            DECODE_TICK_INTERVAL_MS,
+            TimeUnit.MILLISECONDS
+        )
+        Log.i(LogTags.SHERPA_CAPTION, "ASR decode tick interval=${DECODE_TICK_INTERVAL_MS}ms")
     }
 
     private fun Throwable.description(): String {
         return message?.takeIf(String::isNotBlank) ?: javaClass.simpleName
     }
 
-    fun interface Listener {
-        fun onRecognitionStatus(status: SherpaRecognitionStatus)
+    interface Listener {
+        fun onResult(text: String, frames: Long)
+        fun onError(message: String)
     }
 
     private data class ModelFiles(
         val encoder: String,
         val decoder: String,
         val joiner: String,
-        val tokens: String,
-        val bpeModel: String?,
-        val bpeVocab: String?
+        val tokens: String
     )
 
-    private data class RecognizerSetup(
-        val recognizer: OnlineRecognizer,
-        val decodingMethod: String,
-        val hotwordsEnabled: Boolean,
-        val modeName: String,
-        val maxActivePaths: Int,
-        val hotwordsScore: Float,
-        val warning: String? = null
-    )
+    enum class AsrProfile {
+        LOW_LATENCY,
+        BALANCED,
+        ACCURACY
+    }
 
-    private data class DecoderMode(
-        val name: String,
+    private data class DecoderProfileConfig(
+        val profile: AsrProfile,
         val decodingMethod: String,
         val maxActivePaths: Int,
-        val hotwordsEnabled: Boolean,
+        val numThreads: Int,
         val hotwordsScore: Float
     )
 
-    private class MissingModelException(message: String) : IllegalStateException(message)
+    private fun AsrProfile.toConfig(): DecoderProfileConfig {
+        return when (this) {
+            AsrProfile.LOW_LATENCY -> DecoderProfileConfig(
+                profile = this,
+                decodingMethod = DECODING_METHOD_GREEDY,
+                maxActivePaths = 1,
+                numThreads = 2,
+                hotwordsScore = 0.0f
+            )
+
+            AsrProfile.BALANCED -> DecoderProfileConfig(
+                profile = this,
+                decodingMethod = DECODING_METHOD_MODIFIED_BEAM_SEARCH,
+                maxActivePaths = 2,
+                numThreads = 2,
+                hotwordsScore = 0.0f
+            )
+
+            AsrProfile.ACCURACY -> DecoderProfileConfig(
+                profile = this,
+                decodingMethod = DECODING_METHOD_MODIFIED_BEAM_SEARCH,
+                maxActivePaths = 4,
+                numThreads = 4,
+                hotwordsScore = 0.0f
+            )
+        }
+    }
 
     companion object {
         const val DEFAULT_MODEL_ASSET_DIRECTORY =
@@ -555,39 +428,12 @@ class SherpaRecognizer(
 
         private const val SAMPLE_RATE = 16_000
         private const val FEATURE_DIM = 80
-        private const val NUM_THREADS = 2
         private const val PROVIDER = "cpu"
         private const val MODEL_TYPE = "zipformer2"
-        private const val DECODER_MODE = "balanced"
-        private const val DECODER_MODE_LOW_LATENCY = "low_latency"
-        private const val DECODER_MODE_BALANCED = "balanced"
-        private const val DECODER_MODE_ACCURACY = "accuracy"
-        private const val DECODING_METHOD_MODIFIED_BEAM_SEARCH = "modified_beam_search"
+        private val SELECTED_PROFILE = AsrProfile.BALANCED
         private const val DECODING_METHOD_GREEDY = "greedy_search"
-        private const val MODELING_UNIT_BPE = "bpe"
-        private const val LOW_LATENCY_MAX_ACTIVE_PATHS = 1
-        private const val BALANCED_MAX_ACTIVE_PATHS = 2
-        private const val ACCURACY_MAX_ACTIVE_PATHS = 4
-        private const val HOTWORDS_SCORE = 1.5f
-        private const val HOTWORDS_DIRECTORY = "sherpa-onnx/hotwords"
-        private const val MAX_QUEUED_INPUTS = 6
-        private const val INPUT_POLL_TIMEOUT_MS = 100L
-        private const val LATENCY_HINT_LOG_INTERVAL_MS = 1_000L
-        private const val RELEASE_JOIN_TIMEOUT_MS = 2_000L
+        private const val DECODING_METHOD_MODIFIED_BEAM_SEARCH = "modified_beam_search"
+        private const val LOW_LATENCY_FEED_CHUNK_SAMPLES = 640
+        private const val DECODE_TICK_INTERVAL_MS = 40L
     }
-}
-
-data class SherpaRecognitionStatus(
-    val state: SherpaRecognizerState,
-    val partialText: String,
-    val errorMessage: String?,
-    val noticeMessage: String?,
-    val acceptedFrames: Long,
-    val isFinal: Boolean
-)
-
-enum class SherpaRecognizerState {
-    INITIALIZING,
-    RUNNING,
-    ERROR
 }
