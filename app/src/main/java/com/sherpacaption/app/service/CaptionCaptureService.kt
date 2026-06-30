@@ -19,21 +19,21 @@ import androidx.core.app.NotificationCompat
 import com.sherpacaption.app.audio.AudioCaptureConfig
 import com.sherpacaption.app.audio.AudioLevelMeter
 import com.sherpacaption.app.audio.AudioLevelStats
+import com.sherpacaption.app.asr.AsrManager
 import com.sherpacaption.app.capture.PlaybackAudioCapture
 import com.sherpacaption.app.overlay.FloatingCaptionWindow
-import com.sherpacaption.app.sherpa.SherpaRecognizer
 import com.sherpacaption.app.subtitle.StaticLatestLinesRenderer
 import com.sherpacaption.app.util.LogTags
 import com.sherpacaption.app.util.PerformanceMetrics
 import java.util.concurrent.atomic.AtomicBoolean
 
-class CaptionCaptureService : Service(), PlaybackAudioCapture.Listener, SherpaRecognizer.Listener {
+class CaptionCaptureService : Service(), PlaybackAudioCapture.Listener, AsrManager.Listener {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val firstPcmLogged = AtomicBoolean(false)
     private var floatingCaptionWindow: FloatingCaptionWindow? = null
     private var mediaProjection: MediaProjection? = null
     private var playbackAudioCapture: PlaybackAudioCapture? = null
-    private var sherpaRecognizer: SherpaRecognizer? = null
+    private var asrManager: AsrManager? = null
     private val staticLatestLinesRenderer = StaticLatestLinesRenderer()
     private val pcmInputFlowing = AtomicBoolean(true)
     private var lastDisplayedText = ""
@@ -93,22 +93,21 @@ class CaptionCaptureService : Service(), PlaybackAudioCapture.Listener, SherpaRe
             return
         }
         if (!pcmInputFlowing.get()) {
-            Log.d(LogTags.SHERPA_CAPTION, "PCM dropped before ASR because input is silent")
+            LogTags.d { "PCM dropped before ASR because input is silent" }
             return
         }
 
         val level = AudioLevelMeter.calculate(samples, sampleCount, config)
         PerformanceMetrics.markPcmReceived(sampleCount, level.averageAbsolute, level.maxAbsolute)
         if (firstPcmLogged.compareAndSet(false, true)) {
-            Log.i(
-                LogTags.SHERPA_CAPTION,
+            LogTags.iDiagnostic {
                 "PCM_RECEIVED samples=$sampleCount rate=${config.sampleRate} " +
                     "channels=${config.channelLabel}"
-            )
+            }
         } else {
-            Log.d(LogTags.SHERPA_CAPTION, "PCM_RECEIVED samples=$sampleCount")
+            LogTags.d { "PCM_RECEIVED samples=$sampleCount" }
         }
-        sherpaRecognizer?.acceptPcm16(samples, sampleCount, config)
+        asrManager?.acceptPcm16(samples, sampleCount, config)
     }
 
     override fun onResult(text: String, frames: Long) {
@@ -119,14 +118,14 @@ class CaptionCaptureService : Service(), PlaybackAudioCapture.Listener, SherpaRe
                 return@post
             }
             if (rawText == lastDisplayedText) {
-                Log.d(LogTags.SHERPA_CAPTION, "STATIC_RENDER_SKIP_SAME_TEXT")
+                LogTags.d { "STATIC_RENDER_SKIP_SAME_TEXT" }
                 return@post
             }
             lastDisplayedText = rawText
             floatingCaptionWindow?.renderStaticLatestLines(rawText, staticLatestLinesRenderer)
             floatingCaptionWindow?.show()
             PerformanceMetrics.markUiUpdate(resultCreatedAtMs)
-            Log.d(LogTags.SHERPA_CAPTION, "UI_UPDATE text=$rawText")
+            LogTags.d { "UI_UPDATE text=$rawText" }
         }
     }
 
@@ -151,7 +150,7 @@ class CaptionCaptureService : Service(), PlaybackAudioCapture.Listener, SherpaRe
     override fun onSilenceDetected() {
         pcmInputFlowing.set(false)
         PerformanceMetrics.markSpeechIdle()
-        sherpaRecognizer?.markInputIdle()
+        asrManager?.markInputIdle()
         mainHandler.post {
             lastDisplayedText = ""
             floatingCaptionWindow?.hide()
@@ -161,7 +160,7 @@ class CaptionCaptureService : Service(), PlaybackAudioCapture.Listener, SherpaRe
     override fun onSpeechResumed() {
         pcmInputFlowing.set(true)
         PerformanceMetrics.markSpeechResumed()
-        sherpaRecognizer?.markInputResumed()
+        asrManager?.markInputResumed()
     }
 
     override fun isPcmInputFlowing(): Boolean = pcmInputFlowing.get()
@@ -212,10 +211,10 @@ class CaptionCaptureService : Service(), PlaybackAudioCapture.Listener, SherpaRe
         mediaProjection = projection
         Log.i(LogTags.SHERPA_CAPTION, "MediaProjection created")
 
-        sherpaRecognizer = SherpaRecognizer(
+        asrManager = AsrManager(
             context = this,
             listener = this
-        )
+        ).also { it.start() }
 
         playbackAudioCapture = PlaybackAudioCapture(projection, this).also {
             runCatching { it.start() }
@@ -248,8 +247,8 @@ class CaptionCaptureService : Service(), PlaybackAudioCapture.Listener, SherpaRe
     }
 
     private fun releaseSherpaRecognizer() {
-        sherpaRecognizer?.release()
-        sherpaRecognizer = null
+        asrManager?.release()
+        asrManager = null
     }
 
     private fun showFloatingCaptionWindow() {

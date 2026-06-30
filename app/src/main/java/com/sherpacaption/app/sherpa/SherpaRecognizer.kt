@@ -61,6 +61,16 @@ class SherpaRecognizer(
         sampleCount: Int,
         config: AudioCaptureConfig
     ) {
+        val input = runCatching {
+            AsrInputPreparer.prepare(samples, sampleCount, config)
+        }.onFailure { error ->
+            listener.onError("ASR input failed: ${error.description()}")
+        }.getOrNull() ?: return
+
+        acceptWaveform(input.samples)
+    }
+
+    fun acceptWaveform(samples: FloatArray) {
         val currentRecognizer: OnlineRecognizer
         val currentStream: OnlineStream
         synchronized(lock) {
@@ -71,13 +81,7 @@ class SherpaRecognizer(
             currentStream = stream ?: return
         }
 
-        val input = runCatching {
-            AsrInputPreparer.prepare(samples, sampleCount, config)
-        }.onFailure { error ->
-            listener.onError("ASR input failed: ${error.description()}")
-        }.getOrNull() ?: return
-
-        if (input.samples.isEmpty()) {
+        if (samples.isEmpty()) {
             return
         }
 
@@ -86,9 +90,9 @@ class SherpaRecognizer(
                 return
             }
             runCatching {
-                input.samples.feedInLowLatencyChunks { chunk ->
+                samples.feedInLowLatencyChunks { chunk ->
                     val acceptStartNs = SystemClock.elapsedRealtimeNanos()
-                    currentStream.acceptWaveform(chunk, input.sampleRate)
+                    currentStream.acceptWaveform(chunk, SAMPLE_RATE)
                     val acceptedAtNs = SystemClock.elapsedRealtimeNanos()
                     lastAcceptedAtNs.set(acceptedAtNs)
                     PerformanceMetrics.markAcceptWaveform(acceptedAtNs - acceptStartNs)
@@ -354,8 +358,8 @@ class SherpaRecognizer(
 
         lastEmittedText = text
         PerformanceMetrics.markResultAvailability(resultAtNs - acceptedAtNs)
-        Log.d(LogTags.SHERPA_CAPTION, "PCM_RECEIVED frames=$frames")
-        Log.d(LogTags.SHERPA_CAPTION, "ASR_RESULT text=$text")
+        LogTags.d { "PCM_RECEIVED frames=$frames" }
+        LogTags.d { "ASR_RESULT text=$text" }
         listener.onResult(text, frames)
     }
 
