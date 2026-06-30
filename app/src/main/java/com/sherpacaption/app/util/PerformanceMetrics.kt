@@ -17,6 +17,11 @@ object PerformanceMetrics {
     private val firstNonEmptyResultAt = AtomicLong(0L)
     private val firstUiUpdateAt = AtomicLong(0L)
     private val firstReadyDecodeAt = AtomicLong(0L)
+    private val lastSpeechResumeAt = AtomicLong(0L)
+    private val lastSpeechResultAt = AtomicLong(0L)
+    private val speechResumeCount = AtomicLong(0L)
+    private val speechResumeResultLogged = AtomicBoolean(false)
+    private val speechResumeUiLogged = AtomicBoolean(false)
 
     private val pcmCount = AtomicLong(0L)
     private val zeroPcmCount = AtomicLong(0L)
@@ -47,6 +52,8 @@ object PerformanceMetrics {
 
     @Volatile
     private var lastPerfLogAt = 0L
+    @Volatile
+    private var asrProfileInfo = "asrProfile=unknown"
 
     fun reset() {
         firstTokenLogged.set(false)
@@ -56,6 +63,11 @@ object PerformanceMetrics {
         firstNonEmptyResultAt.set(0L)
         firstUiUpdateAt.set(0L)
         firstReadyDecodeAt.set(0L)
+        lastSpeechResumeAt.set(0L)
+        lastSpeechResultAt.set(0L)
+        speechResumeCount.set(0L)
+        speechResumeResultLogged.set(false)
+        speechResumeUiLogged.set(false)
         pcmCount.set(0L)
         zeroPcmCount.set(0L)
         silentPcmCount.set(0L)
@@ -82,6 +94,16 @@ object PerformanceMetrics {
         lastPerfLogAt = SystemClock.elapsedRealtime()
     }
 
+    fun setAsrProfile(
+        profile: String,
+        decodingMethod: String,
+        maxActivePaths: Int,
+        numThreads: Int
+    ) {
+        asrProfileInfo = "asrProfile=$profile decodingMethod=$decodingMethod " +
+            "maxActivePaths=$maxActivePaths numThreads=$numThreads hotwords=disabled"
+    }
+
     fun markPcmReceived(sampleCount: Int, avgLevel: Int, maxLevel: Int) {
         val now = SystemClock.elapsedRealtime()
         firstPcmReceivedAt.compareAndSet(0L, now)
@@ -100,6 +122,18 @@ object PerformanceMetrics {
         }
         pcmAvgLevelTotal.addAndGet(avgLevel.toLong())
         pcmMaxLevelTotal.addAndGet(maxLevel.toLong())
+    }
+
+    fun markSpeechIdle() = Unit
+
+    fun markSpeechResumed() {
+        val now = SystemClock.elapsedRealtime()
+        lastSpeechResumeAt.set(now)
+        lastSpeechResultAt.set(0L)
+        speechResumeCount.incrementAndGet()
+        speechResumeResultLogged.set(false)
+        speechResumeUiLogged.set(false)
+        Log.i(LogTags.SHERPA_CAPTION, "ENCODER_WARM_STATE_REUSE_CHECK_STARTED")
     }
 
     fun markAcceptWaveform(durationNs: Long) {
@@ -126,6 +160,7 @@ object PerformanceMetrics {
 
         val now = SystemClock.elapsedRealtime()
         firstNonEmptyResultAt.compareAndSet(0L, now)
+        logSpeechResumeResultIfNeeded(now)
         val previous = lastAsrResultAt.getAndSet(now)
         if (previous > 0L) {
             asrResultIntervalTotalMs.addAndGet(now - previous)
@@ -150,6 +185,7 @@ object PerformanceMetrics {
             resultToUiTotalMs.addAndGet(duration)
             resultToUiMaxMs.updateMax(duration)
         }
+        logSpeechResumeUiIfNeeded(now)
         logFirstTokenLatencyIfReady()
     }
 
@@ -186,6 +222,7 @@ object PerformanceMetrics {
             "PERF memoryJavaMb=$javaUsedMb memoryNativeMb=$nativeMb " +
                 "memoryTotalMb=$totalMb threadCount=$threadCount " +
                 "availableProcessors=${runtime.availableProcessors()} " +
+                "$asrProfileInfo " +
                 "pcmPipeline=direct pcmCount=$pcmTotal " +
                 "avgPcmIntervalMs=${average(pcmIntervalTotalMs.get(), (pcmTotal - 1).coerceAtLeast(0L))} " +
                 "maxPcmIntervalMs=${pcmIntervalMaxMs.get()} " +
@@ -193,6 +230,7 @@ object PerformanceMetrics {
                 "avgPcmMaxLevel=${average(pcmMaxLevelTotal.get(), pcmTotal)} " +
                 "zeroPcmCount=${zeroPcmCount.get()} silentPcmCount=${silentPcmCount.get()} " +
                 "asrResultCount=$asrTotal uiUpdateCount=$uiTotal " +
+                "speechResumeCount=${speechResumeCount.get()} " +
                 "firstTokenLatencyMs=${firstTokenLatencyMs()} " +
                 "avgAcceptMs=${acceptStats.averageMs()} maxAcceptMs=${acceptStats.maxMs()} " +
                 "avgDecodeQueueMs=${decodeQueueStats.averageMs()} maxDecodeQueueMs=${decodeQueueStats.maxMs()} " +
@@ -211,6 +249,38 @@ object PerformanceMetrics {
                 "avgStaticLayoutMs=${staticLayoutStats.averageMs()} maxStaticLayoutMs=${staticLayoutStats.maxMs()} " +
                 "avgSetTextMs=${setTextStats.averageMs()} maxSetTextMs=${setTextStats.maxMs()} " +
                 "cpuHint=unavailable"
+        )
+    }
+
+    private fun logSpeechResumeResultIfNeeded(resultAt: Long) {
+        val resumeAt = lastSpeechResumeAt.get()
+        if (resumeAt == 0L || resultAt < resumeAt) {
+            return
+        }
+        if (!speechResumeResultLogged.compareAndSet(false, true)) {
+            return
+        }
+        lastSpeechResultAt.set(resultAt)
+        Log.i(
+            LogTags.SHERPA_CAPTION,
+            "SPEECH_RESUME_LATENCY resumeToResultMs=${resultAt - resumeAt}"
+        )
+    }
+
+    private fun logSpeechResumeUiIfNeeded(uiAt: Long) {
+        val resumeAt = lastSpeechResumeAt.get()
+        if (resumeAt == 0L || uiAt < resumeAt) {
+            return
+        }
+        if (!speechResumeUiLogged.compareAndSet(false, true)) {
+            return
+        }
+        val resultAt = lastSpeechResultAt.get()
+        val resultToUi = if (resultAt > 0L) uiAt - resultAt else -1L
+        Log.i(
+            LogTags.SHERPA_CAPTION,
+            "SPEECH_RESUME_UI_LATENCY resumeToUiMs=${uiAt - resumeAt} " +
+                "resultToUiMs=$resultToUi"
         )
     }
 

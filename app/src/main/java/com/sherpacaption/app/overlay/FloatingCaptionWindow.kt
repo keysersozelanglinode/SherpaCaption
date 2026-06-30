@@ -3,6 +3,7 @@ package com.sherpacaption.app.overlay
 import android.content.Context
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
+import android.graphics.text.LineBreaker
 import android.os.Build
 import android.os.SystemClock
 import android.provider.Settings
@@ -209,7 +210,7 @@ class FloatingCaptionWindow(
             setHorizontallyScrolling(false)
             setLineSpacing(0f, LINE_SPACING_MULTIPLIER)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                breakStrategy = Layout.BREAK_STRATEGY_SIMPLE
+                breakStrategy = LineBreaker.BREAK_STRATEGY_SIMPLE
                 hyphenationFrequency = Layout.HYPHENATION_FREQUENCY_NONE
             }
             visibility = View.GONE

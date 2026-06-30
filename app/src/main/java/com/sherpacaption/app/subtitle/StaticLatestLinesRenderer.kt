@@ -1,5 +1,6 @@
 package com.sherpacaption.app.subtitle
 
+import android.graphics.text.LineBreaker
 import android.text.Layout
 import android.text.StaticLayout
 import android.text.TextPaint
@@ -25,7 +26,7 @@ class StaticLatestLinesRenderer(
             .setAlignment(Layout.Alignment.ALIGN_NORMAL)
             .setIncludePad(false)
             .setLineSpacing(0f, 1f)
-            .setBreakStrategy(Layout.BREAK_STRATEGY_SIMPLE)
+            .setBreakStrategy(LineBreaker.BREAK_STRATEGY_SIMPLE)
             .setHyphenationFrequency(Layout.HYPHENATION_FREQUENCY_NONE)
             .build()
 

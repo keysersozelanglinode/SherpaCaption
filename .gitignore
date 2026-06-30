@@ -13,3 +13,6 @@ app/libs/
 *.onnx
 *.aar
 *.apk
+keystore/
+*.jks
+*.keystore

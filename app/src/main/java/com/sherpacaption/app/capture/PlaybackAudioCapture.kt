@@ -4,7 +4,6 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
-import android.media.MediaRecorder
 import android.media.projection.MediaProjection
 import android.os.SystemClock
 import android.util.Log
@@ -67,6 +66,7 @@ class PlaybackAudioCapture(
         val config = preparedCapture.config
         val buffer = ShortArray(config.bufferSizeBytes / BYTES_PER_SHORT)
         var lastUpdateTime = 0L
+        var lastDroppedSilentLogTime = 0L
 
         try {
             record.startRecording()
@@ -103,12 +103,20 @@ class PlaybackAudioCapture(
                     SilenceTransition.NONE -> Unit
                 }
 
-                if (!listener.isPcmInputFlowing()) {
-                    Log.d(
-                        LogTags.SHERPA_CAPTION,
-                        "PCM direct feed continues while inputState=PAUSED read=${stats.read} " +
-                            "avg=${stats.averageAbsolute} max=${stats.maxAbsolute}"
-                    )
+                if (!silenceResult.shouldFeed || !listener.isPcmInputFlowing()) {
+                    if (now - lastDroppedSilentLogTime >= DROPPED_SILENT_LOG_INTERVAL_MS) {
+                        Log.d(
+                            LogTags.SHERPA_CAPTION,
+                            "Dropped silent PCM read=${stats.read} " +
+                                "avg=${stats.averageAbsolute} max=${stats.maxAbsolute}"
+                        )
+                        lastDroppedSilentLogTime = now
+                    }
+                    if (now - lastUpdateTime >= config.updateIntervalMs) {
+                        listener.onAudioLevel(stats)
+                        lastUpdateTime = now
+                    }
+                    continue
                 }
                 listener.onPcmAudio(buffer, read, config)
 
@@ -168,15 +176,19 @@ class PlaybackAudioCapture(
                     .setChannelMask(channelMask)
                     .build()
 
-                val record = runCatching {
+                val record = try {
                     AudioRecord.Builder()
                         .setAudioPlaybackCaptureConfig(playbackConfig)
                         .setAudioFormat(format)
                         .setBufferSizeInBytes(bufferSize)
                         .build()
-                }.onFailure {
-                    failures += "rate=$sampleRate channel=$channelMask error=${it.message}"
-                }.getOrNull() ?: continue
+                } catch (error: SecurityException) {
+                    failures += "rate=$sampleRate channel=$channelMask security=${error.message}"
+                    continue
+                } catch (error: RuntimeException) {
+                    failures += "rate=$sampleRate channel=$channelMask error=${error.message}"
+                    continue
+                }
 
                 if (record.state == AudioRecord.STATE_INITIALIZED) {
                     return PreparedCapture(
@@ -218,5 +230,6 @@ class PlaybackAudioCapture(
         private const val BYTES_PER_SHORT = 2
         private const val BUFFER_SIZE_MULTIPLIER = 4
         private const val STOP_JOIN_TIMEOUT_MS = 1_000L
+        private const val DROPPED_SILENT_LOG_INTERVAL_MS = 1_000L
     }
 }

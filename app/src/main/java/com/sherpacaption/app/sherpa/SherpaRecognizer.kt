@@ -81,7 +81,6 @@ class SherpaRecognizer(
             return
         }
 
-        applyDecodeThreadPriorityIfNeeded()
         synchronized(lock) {
             if (!isRunning.get()) {
                 return
@@ -126,13 +125,32 @@ class SherpaRecognizer(
         }
     }
 
+    fun markInputIdle() {
+        synchronized(lock) {
+            if (isRunning.get() && stream != null) {
+                Log.i(LogTags.SHERPA_CAPTION, "ASR_STREAM_PERSISTED")
+            }
+        }
+    }
+
+    fun markInputResumed() {
+        synchronized(lock) {
+            if (isRunning.get() && stream != null) {
+                Log.i(LogTags.SHERPA_CAPTION, "ASR_STREAM_REUSED")
+                Log.i(LogTags.SHERPA_CAPTION, "ENCODER_WARM_STATE_REUSED")
+            }
+        }
+    }
+
     private fun initialize() {
         synchronized(lock) {
             runCatching {
                 val modelFiles = prepareModelFiles()
                 val createdRecognizer = createRecognizer(modelFiles)
+                val createdStream = createdRecognizer.createStream()
+                prewarmStream(createdRecognizer, createdStream)
                 recognizer = createdRecognizer
-                stream = createdRecognizer.createStream()
+                stream = createdStream
                 acceptedFrames.set(0L)
                 lastAcceptedAtNs.set(0L)
                 lastEmittedText = ""
@@ -230,14 +248,49 @@ class SherpaRecognizer(
             enableEndpoint = true
         }
 
+        PerformanceMetrics.setAsrProfile(
+            profile = profileConfig.profile.name,
+            decodingMethod = profileConfig.decodingMethod,
+            maxActivePaths = profileConfig.maxActivePaths,
+            numThreads = profileConfig.numThreads
+        )
         Log.i(
             LogTags.SHERPA_CAPTION,
-            "ASR decoder profile=${profileConfig.profile} " +
+            "ASR_DECODER_PROFILE=${profileConfig.profile} " +
                 "decodingMethod=${profileConfig.decodingMethod} " +
                 "maxActivePaths=${profileConfig.maxActivePaths} " +
                 "numThreads=${profileConfig.numThreads} hotwords=disabled"
         )
         return OnlineRecognizer(null, recognizerConfig)
+    }
+
+    private fun prewarmStream(
+        recognizer: OnlineRecognizer,
+        stream: OnlineStream
+    ) {
+        if (!ENABLE_STREAM_PREWARM) {
+            return
+        }
+
+        runCatching {
+            val silence = FloatArray(STREAM_PREWARM_SAMPLES)
+            var decodedCount = 0
+            silence.feedInLowLatencyChunks { chunk ->
+                stream.acceptWaveform(chunk, SAMPLE_RATE)
+                while (recognizer.isReady(stream)) {
+                    recognizer.decode(stream)
+                    decodedCount += 1
+                }
+            }
+            val prewarmText = recognizer.getResult(stream).text.trim()
+            Log.i(
+                LogTags.SHERPA_CAPTION,
+                "ASR_STREAM_PREWARM samples=${silence.size} decoded=$decodedCount " +
+                    "resultBlank=${prewarmText.isBlank()}"
+            )
+        }.onFailure { error ->
+            Log.w(LogTags.SHERPA_CAPTION, "ASR stream prewarm skipped: ${error.description()}")
+        }
     }
 
     private fun decodeReadyChunks(
@@ -393,7 +446,7 @@ class SherpaRecognizer(
                 profile = this,
                 decodingMethod = DECODING_METHOD_MODIFIED_BEAM_SEARCH,
                 maxActivePaths = 2,
-                numThreads = 2,
+                numThreads = 3,
                 hotwordsScore = 0.0f
             )
 
@@ -435,5 +488,7 @@ class SherpaRecognizer(
         private const val DECODING_METHOD_MODIFIED_BEAM_SEARCH = "modified_beam_search"
         private const val LOW_LATENCY_FEED_CHUNK_SAMPLES = 640
         private const val DECODE_TICK_INTERVAL_MS = 40L
+        private const val ENABLE_STREAM_PREWARM = true
+        private const val STREAM_PREWARM_SAMPLES = 16_000
     }
 }

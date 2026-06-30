@@ -35,6 +35,7 @@ class CaptionCaptureService : Service(), PlaybackAudioCapture.Listener, SherpaRe
     private var playbackAudioCapture: PlaybackAudioCapture? = null
     private var sherpaRecognizer: SherpaRecognizer? = null
     private val staticLatestLinesRenderer = StaticLatestLinesRenderer()
+    private val pcmInputFlowing = AtomicBoolean(true)
     private var lastDisplayedText = ""
     private var serviceStopReason = "not stopped"
 
@@ -52,6 +53,7 @@ class CaptionCaptureService : Service(), PlaybackAudioCapture.Listener, SherpaRe
             ACTION_START -> {
                 Log.i(LogTags.SHERPA_CAPTION, "Service start")
                 serviceStopReason = "running"
+                pcmInputFlowing.set(true)
                 PerformanceMetrics.reset()
                 startCaptureForeground()
                 showFloatingCaptionWindow()
@@ -88,6 +90,10 @@ class CaptionCaptureService : Service(), PlaybackAudioCapture.Listener, SherpaRe
         config: AudioCaptureConfig
     ) {
         if (sampleCount <= 0) {
+            return
+        }
+        if (!pcmInputFlowing.get()) {
+            Log.d(LogTags.SHERPA_CAPTION, "PCM dropped before ASR because input is silent")
             return
         }
 
@@ -143,15 +149,22 @@ class CaptionCaptureService : Service(), PlaybackAudioCapture.Listener, SherpaRe
     }
 
     override fun onSilenceDetected() {
+        pcmInputFlowing.set(false)
+        PerformanceMetrics.markSpeechIdle()
+        sherpaRecognizer?.markInputIdle()
         mainHandler.post {
             lastDisplayedText = ""
             floatingCaptionWindow?.hide()
         }
     }
 
-    override fun onSpeechResumed() = Unit
+    override fun onSpeechResumed() {
+        pcmInputFlowing.set(true)
+        PerformanceMetrics.markSpeechResumed()
+        sherpaRecognizer?.markInputResumed()
+    }
 
-    override fun isPcmInputFlowing(): Boolean = true
+    override fun isPcmInputFlowing(): Boolean = pcmInputFlowing.get()
 
     override fun onReadError(message: String) {
         Log.w(LogTags.SHERPA_CAPTION, message)
